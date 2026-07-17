@@ -1,0 +1,22 @@
+[
+  {"id": "P001", "name": "Elon Musk", "nationality": "USA", "summary": "CEO of Tesla and SpaceX"},
+  {"id": "P002", "name": "Sundar Pichai", "nationality": "India", "summary": "CEO of Alphabet"},
+  {"id": "P003", "name": "Tim Cook", "nationality": "USA", "summary": "CEO of Apple"},
+  {"id": "P004", "name": "马云", "nationality": "China", "summary": "Founder of Alibaba"},
+  {"id": "P005", "name": "马化腾", "nationality": "China", "summary": "CEO of Tencent"},
+  {"id": "P006", "name": "Warren Buffett", "nationality": "USA", "summary": "Chairman of Berkshire Hathaway"},
+  {"id": "P007", "name": "Jeff Bezos", "nationality": "USA", "summary": "Founder of Amazon"},
+  {"id": "P008", "name": "Satya Nadella", "nationality": "India", "summary": "CEO of Microsoft"},
+  {"id": "P009", "name": "黄峥", "nationality": "China", "summary": "Founder of Pinduoduo"},
+  {"id": "P010", "name": "刘强东", "nationality": "China", "summary": "Founder of JD.com"},
+  {"id": "P011", "name": "Larry Page", "nationality": "USA", "summary": "Co-founder of Google"},
+  {"id": "P012", "name": "Sergey Brin", "nationality": "USA", "summary": "Co-founder of Google"},
+  {"id": "P013", "name": "杨元庆", "nationality": "China", "summary": "CEO of Lenovo"},
+  {"id": "P014", "name": "董明珠", "nationality": "China", "summary": "Chairwoman of Gree Electric"},
+  {"id": "P015", "name": "雷军", "nationality": "China", "summary": "Founder of Xiaomi"},
+  {"id": "P016", "name": "任正非", "nationality": "China", "summary": "Founder of Huawei"},
+  {"id": "P017", "name": "Jack Dorsey", "nationality": "USA", "summary": "Co-founder of Twitter and Block"},
+  {"id": "P018", "name": "Mark Zuckerberg", "nationality": "USA", "summary": "CEO of Meta"},
+  {"id": "P019", "name": "张一鸣", "nationality": "China", "summary": "Founder of ByteDance"},
+  {"id": "P020", "name": "王兴", "nationality": "China", "summary": "CEO of Meituan"}
+]
