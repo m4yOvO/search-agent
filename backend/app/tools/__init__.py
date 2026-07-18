@@ -1,0 +1,56 @@
+"""Validated demo fixture repository and typed Researcher tools."""
+
+from app.tools.contracts import (
+    ENTITY_MATCH_ALGORITHM_VERSION,
+    FUZZY_ACCEPT_THRESHOLD,
+    FUZZY_MIN_MARGIN,
+    CompaniesRequest,
+    CompanyAttribute,
+    EntityMatchProof,
+    MatchKind,
+    MatchMode,
+    PersonAttribute,
+    PersonsRequest,
+    RawRelationType,
+    RelationDirection,
+    RelationsRequest,
+    ToolResultMeta,
+    TypedToolResult,
+)
+from app.tools.registry import (
+    ToolRegistry,
+    build_tool_registry,
+    companies,
+    persons,
+    relations,
+)
+from app.tools.repository import DataValidationError, FixtureRepository
+from app.tools.specs import ToolHandlerOutput, ToolSpec, create_tool_spec
+
+__all__ = [
+    "CompaniesRequest",
+    "CompanyAttribute",
+    "DataValidationError",
+    "ENTITY_MATCH_ALGORITHM_VERSION",
+    "EntityMatchProof",
+    "FUZZY_ACCEPT_THRESHOLD",
+    "FUZZY_MIN_MARGIN",
+    "FixtureRepository",
+    "MatchKind",
+    "MatchMode",
+    "PersonAttribute",
+    "PersonsRequest",
+    "RawRelationType",
+    "RelationDirection",
+    "RelationsRequest",
+    "ToolHandlerOutput",
+    "ToolRegistry",
+    "ToolResultMeta",
+    "ToolSpec",
+    "TypedToolResult",
+    "build_tool_registry",
+    "companies",
+    "create_tool_spec",
+    "persons",
+    "relations",
+]

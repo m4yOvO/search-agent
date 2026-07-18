@@ -1,0 +1,25 @@
+.git
+.DS_Store
+.env
+.env.*
+secrets
+.venv
+backend/.venv
+backend/.pytest_cache
+backend/.coverage
+backend/htmlcov
+**/__pycache__
+**/*.pyc
+frontend/node_modules
+frontend/dist
+frontend/coverage
+frontend/*.tsbuildinfo
+output
+.playwright-cli
+runtime
+chroma-data
+data/*
+!data/person 1.json
+!data/company 1.json
+!data/relations 1.json
+curated relations.json

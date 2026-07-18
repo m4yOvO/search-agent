@@ -1,0 +1,99 @@
+name: enterprise-relationship-explorer
+
+services:
+  chroma:
+    image: chromadb/chroma:1.5.9
+    restart: unless-stopped
+    volumes:
+      - chroma_data:/data
+    expose:
+      - "8000"
+    ports:
+      - "127.0.0.1:${CHROMA_HOST_PORT:-8001}:8000"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8000"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+  backend-runtime-init:
+    image: busybox:1.37.0
+    restart: "no"
+    user: "0:0"
+    command: ["chown", "-R", "10001:10001", "/runtime"]
+    volumes:
+      - backend_runtime:/runtime
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    environment:
+      APP_ENV: production
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      AGENT_MODE: openai
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?OPENAI_API_KEY must be set in the untracked .env file}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.4-mini}
+      OPENAI_TIMEOUT_SECONDS: ${OPENAI_TIMEOUT_SECONDS:-45}
+      OPENAI_MAX_RETRIES: ${OPENAI_MAX_RETRIES:-2}
+      AGENT_MAX_ITERATIONS: ${AGENT_MAX_ITERATIONS:-20}
+      DATA_DIRECTORY: /app/data
+      RUNTIME_DIRECTORY: /app/runtime
+      CHECKPOINT_PATH: /app/runtime/checkpoints.sqlite3
+      GRAPH_STORE_PATH: /app/runtime/graphs.sqlite3
+      CHROMA_HOST: chroma
+      CHROMA_PORT: 8000
+      CHROMA_COLLECTION_PREFIX: ${CHROMA_COLLECTION_PREFIX:-enterprise_query_cache_v18}
+      CHROMA_CONNECT_RETRIES: ${CHROMA_CONNECT_RETRIES:-12}
+      CHROMA_RETRY_DELAY_SECONDS: ${CHROMA_RETRY_DELAY_SECONDS:-1.0}
+      SHORT_TERM_MAX_TURNS: ${SHORT_TERM_MAX_TURNS:-15}
+      SHORT_TERM_COMPACT_OLDEST: ${SHORT_TERM_COMPACT_OLDEST:-10}
+      SHORT_TERM_KEEP_RECENT: ${SHORT_TERM_KEEP_RECENT:-5}
+      CACHE_TTL_HOURS: ${CACHE_TTL_HOURS:-24}
+      GRAPH_SCHEMA_VERSION: ${GRAPH_SCHEMA_VERSION:-1}
+      QUERY_SIGNATURE_VERSION: ${QUERY_SIGNATURE_VERSION:-4}
+      PERMISSION_SCOPE: ${PERMISSION_SCOPE:-public-demo}
+      MAX_RESEARCH_STEPS: ${MAX_RESEARCH_STEPS:-12}
+      MAX_TOOL_CALLS: ${MAX_TOOL_CALLS:-10}
+      MAX_REPLANS: ${MAX_REPLANS:-2}
+      RESEARCH_RETRY_STEP_ALLOWANCE: ${RESEARCH_RETRY_STEP_ALLOWANCE:-3}
+      GRAPH_RECURSION_LIMIT: ${GRAPH_RECURSION_LIMIT:-64}
+      TOOL_TIMEOUT_SECONDS: ${TOOL_TIMEOUT_SECONDS:-5}
+      CHAT_TIMEOUT_SECONDS: ${CHAT_TIMEOUT_SECONDS:-570}
+      ALLOWED_ORIGINS: '["http://localhost:3000"]'
+    volumes:
+      - backend_runtime:/app/runtime
+    ports:
+      - "127.0.0.1:${BACKEND_HOST_PORT:-8000}:8000"
+    depends_on:
+      backend-runtime-init:
+        condition: service_completed_successfully
+      chroma:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=5)"
+      interval: 10s
+      timeout: 7s
+      retries: 12
+      start_period: 10s
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${FRONTEND_HOST_PORT:-3000}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  backend_runtime:
+  chroma_data:
