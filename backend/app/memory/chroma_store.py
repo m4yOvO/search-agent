@@ -6,7 +6,6 @@ import asyncio
 import inspect
 import json
 import logging
-import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -25,6 +24,7 @@ from app.schemas import (
     CachedPayload,
     Evidence,
     GraphPayload,
+    Intent,
     MemoryOperation,
     QuerySignature,
 )
@@ -152,12 +152,31 @@ class LongTermMemory:
     def raw_hash(self, query: str, locale: str) -> str:
         return raw_query_hash(query, locale, self.settings.permission_scope)
 
-    def canonical_id(self, signature: QuerySignature) -> str:
+    @staticmethod
+    def _conversation_owner_hash(conversation_id: str) -> str:
+        return stable_hash({"conversation_id": conversation_id})
+
+    def canonical_id(
+        self,
+        signature: QuerySignature,
+        *,
+        cache_scope: CacheScope = CacheScope.CONTEXT_FREE,
+        conversation_id: str | None = None,
+    ) -> str:
+        if cache_scope is CacheScope.CONVERSATION:
+            if not conversation_id:
+                raise ValueError("conversation_id_required")
+            owner_hash = self._conversation_owner_hash(conversation_id)
+        else:
+            if conversation_id is not None:
+                raise ValueError("context_free_conversation_id_forbidden")
+            owner_hash = None
         return canonical_query_id(
             signature,
             data_version=self.data_version,
             graph_schema_version=self.settings.graph_schema_version,
             permission_scope=self.settings.permission_scope,
+            conversation_owner_hash=owner_hash,
         )
 
     async def lookup_raw(self, query: str, locale: str) -> CacheLookup:
@@ -179,10 +198,23 @@ class LongTermMemory:
         except Exception as exc:
             return self._read_failure(exc, "raw_exact")
 
-    async def lookup_canonical(self, signature: QuerySignature) -> CacheLookup:
+    async def lookup_canonical(
+        self,
+        signature: QuerySignature,
+        *,
+        cache_scope: CacheScope = CacheScope.CONTEXT_FREE,
+        conversation_id: str | None = None,
+    ) -> CacheLookup:
         if self.collection is None:
             return CacheLookup(error="cache_unavailable")
-        record_id = self.canonical_id(signature)
+        try:
+            record_id = self.canonical_id(
+                signature,
+                cache_scope=cache_scope,
+                conversation_id=conversation_id,
+            )
+        except ValueError as exc:
+            return CacheLookup(error=str(exc))
         try:
             result = await _call(
                 self.collection.get,
@@ -194,6 +226,8 @@ class LongTermMemory:
                 match_type="canonical_exact",
                 expected_canonical_id=record_id,
                 expected_signature=signature,
+                expected_cache_scope=cache_scope,
+                expected_conversation_id=conversation_id,
             )
         except Exception as exc:
             return self._read_failure(exc, "canonical_exact")
@@ -216,6 +250,8 @@ class LongTermMemory:
         expected_locale: str | None = None,
         expected_canonical_id: str | None = None,
         expected_signature: QuerySignature | None = None,
+        expected_cache_scope: CacheScope | None = None,
+        expected_conversation_id: str | None = None,
     ) -> CacheLookup:
         ids = list((result or {}).get("ids") or [])
         if not ids:
@@ -255,6 +291,8 @@ class LongTermMemory:
                     expected_locale=expected_locale,
                     expected_canonical_id=expected_canonical_id,
                     expected_signature=expected_signature,
+                    expected_cache_scope=expected_cache_scope,
+                    expected_conversation_id=expected_conversation_id,
                 )
             except Exception as exc:
                 reason = f"invalid_cache_payload:{exc}"
@@ -293,12 +331,33 @@ class LongTermMemory:
         expected_locale: str | None,
         expected_canonical_id: str | None,
         expected_signature: QuerySignature | None,
+        expected_cache_scope: CacheScope | None,
+        expected_conversation_id: str | None,
     ) -> None:
         signature = payload.query_signature
         if signature.version != self.settings.query_signature_version:
             raise ValueError("payload_signature_version_mismatch")
         if metadata.get("cache_scope") != payload.cache_scope.value:
             raise ValueError("payload_cache_scope_mismatch")
+        if expected_cache_scope is not None and payload.cache_scope is not expected_cache_scope:
+            raise ValueError("requested_cache_scope_mismatch")
+        metadata_owner_hash = metadata.get("conversation_owner_hash")
+        if payload.cache_scope is CacheScope.CONVERSATION:
+            if payload.conversation_id is None:
+                raise ValueError("payload_missing_conversation_id")
+            owner_hash = self._conversation_owner_hash(payload.conversation_id)
+            if metadata_owner_hash != owner_hash:
+                raise ValueError("payload_conversation_owner_mismatch")
+            if (
+                expected_conversation_id is not None
+                and payload.conversation_id != expected_conversation_id
+            ):
+                raise ValueError("requested_conversation_owner_mismatch")
+        else:
+            if payload.conversation_id is not None or metadata_owner_hash is not None:
+                raise ValueError("context_free_conversation_owner_present")
+            if expected_conversation_id is not None:
+                raise ValueError("unexpected_conversation_owner")
         if payload.graph.data_version != self.data_version:
             raise ValueError("payload_data_version_mismatch")
         if metadata.get("intent") != signature.intent.value:
@@ -311,7 +370,11 @@ class LongTermMemory:
         if expected_raw_hash is not None and metadata.get("raw_query_hash") != expected_raw_hash:
             raise ValueError("raw_query_hash_mismatch")
 
-        canonical_id = self.canonical_id(signature)
+        canonical_id = self.canonical_id(
+            signature,
+            cache_scope=payload.cache_scope,
+            conversation_id=payload.conversation_id,
+        )
         if record_id != canonical_id:
             raise ValueError("payload_canonical_id_mismatch")
         if expected_canonical_id is not None and record_id != expected_canonical_id:
@@ -334,6 +397,39 @@ class LongTermMemory:
         graph_node_ids = {node.id for node in payload.graph.nodes}
         if set(payload.focus_entity_ids) - graph_node_ids:
             raise ValueError("payload_focus_outside_graph")
+        if signature.intent is Intent.MULTI_GOAL and not signature.goals:
+            raise ValueError("payload_missing_goal_signatures")
+        if signature.goals:
+            graph_record_ids = {
+                *graph_node_ids,
+                *(edge.id for edge in payload.graph.edges),
+            }
+            goal_record_ids = {
+                record_id
+                for goal in signature.goals
+                for record_id in goal.result_record_ids
+            }
+            if goal_record_ids - graph_record_ids:
+                raise ValueError("payload_goal_records_outside_graph")
+            goal_focus = {
+                entity_id
+                for goal in signature.goals
+                for entity_id in goal.focus_entity_ids
+            }
+            if goal_focus - graph_node_ids:
+                raise ValueError("payload_goal_focus_outside_graph")
+            if set(payload.focus_entity_ids) != goal_focus:
+                raise ValueError("payload_goal_focus_mismatch")
+            goal_context_ids = {
+                entity_id
+                for goal in signature.goals
+                for entity_id in goal.context_entity_ids
+            }
+            if (
+                goal_context_ids
+                and payload.cache_scope is not CacheScope.CONVERSATION
+            ):
+                raise ValueError("payload_goal_context_scope_mismatch")
         if evidence_coverage(payload.graph, payload.evidence) < 1.0:
             raise ValueError("payload_incomplete_evidence")
         if metadata.get("payload_hash") != self._payload_hash(payload):
@@ -458,6 +554,7 @@ class LongTermMemory:
         focus_entity_ids: list[str] | None = None,
         resolved_entities: dict[str, str] | None = None,
         cache_scope: CacheScope = CacheScope.CONTEXT_FREE,
+        conversation_id: str | None = None,
     ) -> CacheWriteResult:
         if self.collection is None:
             return CacheWriteResult(False, MemoryOperation.SKIP, reason="memory_write_failed:cache_unavailable")
@@ -473,7 +570,21 @@ class LongTermMemory:
             return CacheWriteResult(
                 False, MemoryOperation.SKIP, reason="graph_data_version_mismatch"
             )
-        record_id = self.canonical_id(signature)
+        if cache_scope is CacheScope.CONVERSATION and not conversation_id:
+            return CacheWriteResult(
+                False, MemoryOperation.SKIP, reason="conversation_id_required"
+            )
+        if cache_scope is CacheScope.CONTEXT_FREE and conversation_id is not None:
+            return CacheWriteResult(
+                False,
+                MemoryOperation.SKIP,
+                reason="context_free_conversation_id_forbidden",
+            )
+        record_id = self.canonical_id(
+            signature,
+            cache_scope=cache_scope,
+            conversation_id=conversation_id,
+        )
         now = datetime.now(UTC)
         expires_at = now + timedelta(hours=self.settings.cache_ttl_hours)
         payload = CachedPayload(
@@ -484,6 +595,7 @@ class LongTermMemory:
             focus_entity_ids=focus_entity_ids or [],
             resolved_entities=resolved_entities or {},
             cache_scope=cache_scope,
+            conversation_id=conversation_id,
         )
         metadata: dict[str, str | int | float | bool] = {
             "record_type": "canonical_query_result",
@@ -503,6 +615,11 @@ class LongTermMemory:
         }
         if cache_scope is CacheScope.CONTEXT_FREE:
             metadata["raw_query_hash"] = self.raw_hash(raw_query, locale)
+        else:
+            assert conversation_id is not None
+            metadata["conversation_owner_hash"] = self._conversation_owner_hash(
+                conversation_id
+            )
         try:
             self._validate_payload(
                 record_id,
@@ -516,6 +633,8 @@ class LongTermMemory:
                 expected_locale=locale,
                 expected_canonical_id=record_id,
                 expected_signature=signature,
+                expected_cache_scope=cache_scope,
+                expected_conversation_id=conversation_id,
             )
         except ValueError as exc:
             return CacheWriteResult(

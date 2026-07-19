@@ -8,6 +8,7 @@ backend/.venv
 backend/.pytest_cache
 backend/.coverage
 backend/htmlcov
+backend/tests
 **/__pycache__
 **/*.pyc
 frontend/node_modules

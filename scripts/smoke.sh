@@ -48,7 +48,7 @@ compose_up=(up -d --force-recreate backend frontend)
 if [[ "$skip_build" == "0" ]]; then
   compose_up=(up --build -d --force-recreate backend frontend)
 fi
-CHROMA_COLLECTION_PREFIX="$smoke_collection" QUERY_SIGNATURE_VERSION=4 \
+CHROMA_COLLECTION_PREFIX="$smoke_collection" QUERY_SIGNATURE_VERSION=5 \
   docker compose "${compose_up[@]}"
 
 ready=0

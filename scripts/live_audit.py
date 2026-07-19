@@ -61,7 +61,7 @@ CONTROL_FALLBACK_RELATIONS = frozenset(
         "Owns",
     }
 )
-ZH_DEMO_DISCLAIMER = "结果来自本地演示数据，不代表实时工商或法律结论。"
+REMOVED_DEMO_DISCLAIMER = "结果来自本地演示数据，不代表实时工商或法律结论。"
 ZH_CONTROL_DISCLOSURE = (
     "原始数据没有显式控制记录，以下为创办、现任管理或明确持有关系，"
     "不等同法律控制。"
@@ -533,13 +533,10 @@ def assert_success(body: Mapping[str, Any], case: str) -> None:
     _require(body.get("error_code") is None, f"{case}: unexpected error_code")
     _require(isinstance(body.get("request_id"), str), f"{case}: missing request_id")
     _require(isinstance(body.get("conversation_id"), str), f"{case}: missing conversation_id")
+    _require(body.get("disclaimer") == "", f"{case}: disclaimer must be empty")
     _require(
-        body.get("disclaimer") == ZH_DEMO_DISCLAIMER,
-        f"{case}: top-level demo disclaimer changed",
-    )
-    _require(
-        ZH_DEMO_DISCLAIMER in str(body.get("answer", "")),
-        f"{case}: answer lacks the fixed demo disclosure",
+        REMOVED_DEMO_DISCLAIMER not in str(body.get("answer", "")),
+        f"{case}: removed demo disclaimer is still present in the answer",
     )
     assert_graph_integrity(body, case)
 
@@ -792,36 +789,80 @@ def researcher_relation_events(
 def assert_catalog_alignment_trace(body: Mapping[str, Any], case: str) -> None:
     steps = _trace(body, case).get("agent_steps")
     _require(isinstance(steps, list), f"{case}: agent_steps must be an array")
-    accepted = [
+    entity_results = [
         step
         for step in steps
         if isinstance(step, dict)
         and step.get("role") == "researcher"
         and step.get("action") == "tool_result"
-        and step.get("resolution_strategy") == "exact"
+        and step.get("tool") in {"persons", "companies"}
     ]
-    actual = {
-        (
-            str(step.get("tool")),
-            str(step.get("resolution_version")),
-            tuple(step.get("record_ids", [])),
+    def matched_entity_ids(
+        step: Mapping[str, Any], tool: str
+    ) -> tuple[str, ...]:
+        record_ids = step.get("record_ids", [])
+        _require(
+            isinstance(record_ids, list),
+            f"{case}: entity tool record_ids must be an array",
         )
-        for step in accepted
+        entity_prefix = "company:" if tool == "companies" else "person:"
+        allowed_prefixes = (
+            ("company:", "location:", "relation:")
+            if tool == "companies"
+            else ("person:",)
+        )
+        _require(
+            all(
+                isinstance(record_id, str)
+                and record_id.startswith(allowed_prefixes)
+                for record_id in record_ids
+            ),
+            f"{case}: entity tool trace contains an invalid record kind",
+        )
+        # Entity lookup receipts may include evidence-closure records (for
+        # example a company's raw headquarters edge and location node).  Match
+        # proof is about the entity record itself, so compare only that type
+        # while retaining the prefix guard above for every attached record.
+        return tuple(
+            record_id
+            for record_id in record_ids
+            if record_id.startswith(entity_prefix)
+        )
+
+    actual = {
+        tool: [
+            (
+                str(step.get("resolution_strategy")),
+                str(step.get("resolution_version")),
+                matched_entity_ids(step, tool),
+            )
+            for step in entity_results
+            if step.get("tool") == tool
+        ]
+        for tool in ("companies", "persons")
     }
     expected = {
-        ("companies", "entity-match-v1", ("company:C001",)),
-        ("persons", "entity-match-v1", ("person:P001",)),
+        "companies": [
+            ("exact", "entity-match-v2", ()),
+            ("fuzzy", "entity-match-v2", ()),
+            ("cross_language_exact", "entity-match-v2", ("company:C001",)),
+        ],
+        "persons": [
+            ("exact", "entity-match-v2", ()),
+            ("fuzzy", "entity-match-v2", ()),
+            ("cross_language_exact", "entity-match-v2", ("person:P001",)),
+        ],
     }
     _require(
         actual == expected,
-        f"{case}: catalog-alignment trace mismatch; expected={sorted(expected)}, actual={sorted(actual)}",
+        f"{case}: catalog-alignment trace mismatch; expected={expected}, actual={actual}",
     )
     _require(
         all(
             step.get("resolution_strategy") is None
             and step.get("resolution_version") is None
             for step in steps
-            if step not in accepted
+            if step not in entity_results
         ),
         f"{case}: resolution metadata appeared outside accepted entity tool_result steps",
     )
@@ -863,17 +904,23 @@ def _assert_route_shape(
         _require(route == expected, f"{case}: raw-hit route drift: {route}")
         return
 
+    fresh_prefix = [
+        "begin_turn",
+        "raw_cache_probe",
+        "planner_analyze",
+        "planner_tasks",
+    ]
     _require(
-        route[:3] == ["begin_turn", "raw_cache_probe", "planner"],
-        f"{case}: fresh route has an invalid prefix: {route[:3]}",
+        route[:4] == fresh_prefix,
+        f"{case}: fresh route has an invalid prefix: {route[:4]}",
     )
     researcher_calls = int(trace.get("researcher_model_calls", 0))
-    research_segment = route[3 : 3 + researcher_calls * 2]
+    research_segment = route[4 : 4 + researcher_calls * 2]
     _require(
         research_segment == ["researcher", "result_gate"] * researcher_calls,
         f"{case}: Researcher/ResultGate route is not strictly paired",
     )
-    tail = route[3 + researcher_calls * 2 :]
+    tail = route[4 + researcher_calls * 2 :]
     expected_tails = {
         "fresh": [
             "canonical_cache_probe",
@@ -923,7 +970,10 @@ def assert_fresh_trace(
     _require(trace.get("researcher_invoked") is True, f"{case}: Researcher not invoked")
     _require(trace.get("model_provider") == "openai", f"{case}: provider is not OpenAI")
     _require(isinstance(trace.get("model_name"), str), f"{case}: model name missing")
-    _require(trace.get("planner_model_calls") == 1, f"{case}: Planner call count is not 1")
+    _require(
+        trace.get("planner_model_calls") == 2,
+        f"{case}: fresh research path must call both Planner stages exactly once",
+    )
     _require(trace.get("replans") == 0, f"{case}: unexpected replan")
     _require(
         trace.get("research_steps") == trace.get("researcher_model_calls"),
@@ -1065,11 +1115,16 @@ def assert_control_public_contract(body: Mapping[str, Any], case: str) -> None:
     control_calls = [event for event in control_events if event.get("action") == "call_tool"]
     control_results = [event for event in control_events if event.get("action") == "tool_result"]
     expected_scopes = [{"controls"}, {"founded", "works_at", "owns"}]
-    _require(
-        [set(event.get("relation_types", [])) for event in control_calls]
-        == expected_scopes,
-        f"{case}: control phases are missing, out of order, or have the wrong typed scope",
-    )
+    # Current safe public traces retain executed tool results and fingerprints;
+    # some compatible trace versions also retain the preceding call proposal.
+    # Validate proposals when present, but do not require a field the public API
+    # intentionally omits. The two executed result scopes below are mandatory.
+    if control_calls:
+        _require(
+            [set(event.get("relation_types", [])) for event in control_calls]
+            == expected_scopes,
+            f"{case}: control phases are missing, out of order, or have the wrong typed scope",
+        )
     _require(
         [set(event.get("relation_types", [])) for event in control_results]
         == expected_scopes,
@@ -1094,7 +1149,27 @@ def assert_canonical_or_fresh_equivalent_trace(
     required_tools: set[str],
     expected_touch_operation: str,
 ) -> None:
-    """A paraphrase must research to the same signature and hit canonical cache."""
+    """Accept a canonical hit or a separately verified, signature-distinct result.
+
+    Two paraphrases can select the same raw rows while retaining different
+    requested raw qualifiers in their canonical signatures.  Those qualifiers
+    are deliberately cache-significant, so graph equality alone must not force
+    cache reuse.  Either path must still complete full Agent/tool verification;
+    only an exact canonical signature may bypass Visualizer.
+    """
+
+    memory = body.get("memory")
+    _require(isinstance(memory, dict), f"{case}: memory must be an object")
+    if memory.get("cache_hit") is False:
+        assert_fresh_trace(
+            body,
+            case,
+            required_tools=required_tools,
+            require_visualizer=True,
+            route_path="fresh",
+        )
+        assert_warm_add(body, case)
+        return
 
     assert_fresh_trace(
         body,
@@ -1103,9 +1178,7 @@ def assert_canonical_or_fresh_equivalent_trace(
         require_visualizer=False,
         route_path="canonical_hit",
     )
-    memory = body.get("memory")
-    _require(isinstance(memory, dict), f"{case}: memory must be an object")
-    _require(memory.get("cache_hit") is True, f"{case}: semantic paraphrase missed canonical cache")
+    _require(memory.get("cache_hit") is True, f"{case}: invalid cache_hit value")
     _require(
         memory.get("match_type") == "canonical_exact",
         f"{case}: paraphrase did not use canonical_exact",

@@ -6,6 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
+    TIKTOKEN_CACHE_DIR=/app/tiktoken_cache \
     PATH="/app/.venv/bin:$PATH"
 
 WORKDIR /app
@@ -18,6 +19,11 @@ COPY backend/pyproject.toml backend/uv.lock ./
 # package itself is imported directly from /app, so no un-locked PEP 517 build
 # environment is needed and this layer remains reusable when source files change.
 RUN uv sync --frozen --no-dev --no-install-project
+
+# tiktoken downloads its vocabulary on first use. Cache it in the image so
+# application startup and Planner budgeting never depend on runtime internet.
+RUN mkdir -p "$TIKTOKEN_CACHE_DIR" \
+    && .venv/bin/python -c 'import tiktoken; tiktoken.get_encoding("o200k_base")'
 
 COPY backend/app ./app
 

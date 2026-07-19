@@ -121,7 +121,6 @@ export default function App() {
 
       <footer className="disclosure">
         <span>DEMO / PUBLIC FIXTURES</span>
-        <p>结果来自本地演示数据，不代表实时工商或法律结论。请勿用于投资、法律或尽调决策。</p>
       </footer>
     </div>
   );

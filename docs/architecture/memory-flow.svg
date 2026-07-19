@@ -1,0 +1,107 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="760" viewBox="0 0 1440 760" role="img" aria-labelledby="title desc">
+  <title id="title">企业关系探索系统的双层记忆流向</title>
+  <desc id="desc">SQLite 保存最多十五轮短期会话和最后成功焦点，Chroma 保存通过证据策略验证的长期查询图谱。原始查询命中长期缓存时绕过全部智能体。</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#15803d"/>
+    </marker>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="5" flood-color="#0f172a" flood-opacity="0.12"/>
+    </filter>
+    <style>
+      .canvas { fill: #f8fafc; }
+      .title { font: 700 30px Inter, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #0f172a; }
+      .subtitle { font: 400 15px Inter, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #475569; }
+      .lane-title { font: 700 19px Inter, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #0f172a; }
+      .node-title { font: 700 16px Inter, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #0f172a; text-anchor: middle; }
+      .detail { font: 400 13px Inter, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #475569; text-anchor: middle; }
+      .edge-label { font: 600 12px Inter, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #475569; paint-order: stroke; stroke: #f8fafc; stroke-width: 5px; }
+      .edge { fill: none; stroke: #475569; stroke-width: 2; marker-end: url(#arrow); }
+      .edge-green { fill: none; stroke: #15803d; stroke-width: 2.5; marker-end: url(#arrow-green); }
+      .lane { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; rx: 20; filter: url(#shadow); }
+      .request { fill: #ecfeff; stroke: #0891b2; stroke-width: 2; rx: 14; }
+      .short { fill: #dbeafe; stroke: #2563eb; stroke-width: 2; rx: 14; }
+      .long { fill: #ffedd5; stroke: #ea580c; stroke-width: 2; rx: 14; }
+      .agent { fill: #f3e8ff; stroke: #9333ea; stroke-width: 2; rx: 14; }
+      .verified { fill: #dcfce7; stroke: #16a34a; stroke-width: 2; rx: 14; }
+      .skip { fill: #f1f5f9; stroke: #64748b; stroke-width: 1.5; rx: 12; }
+    </style>
+  </defs>
+
+  <rect class="canvas" width="1440" height="760" rx="24"/>
+  <text class="title" x="56" y="48">双层记忆流向</text>
+  <text class="subtitle" x="56" y="75">短期记忆保持会话连续性；长期记忆复用证据完整的高价值结果</text>
+
+  <rect class="request" x="54" y="112" width="226" height="86"/>
+  <text class="node-title" x="167" y="145">新请求</text>
+  <text class="detail" x="167" y="170">query + conversation_id</text>
+
+  <rect class="lane" x="330" y="100" width="1054" height="260"/>
+  <text class="lane-title" x="362" y="137">长期记忆 · Chroma</text>
+
+  <rect class="long" x="366" y="166" width="220" height="82"/>
+  <text class="node-title" x="476" y="197">raw_cache_probe</text>
+  <text class="detail" x="476" y="222">Planner 前精确匹配 query</text>
+
+  <rect class="long" x="650" y="166" width="220" height="82"/>
+  <text class="node-title" x="760" y="197">Chroma</text>
+  <text class="detail" x="760" y="222">WARM → HOT</text>
+
+  <rect class="verified" x="934" y="150" width="252" height="114"/>
+  <text class="node-title" x="1060" y="184">缓存命中直接响应</text>
+  <text class="detail" x="1060" y="209">Planner / Researcher / Visualizer</text>
+  <text class="detail" x="1060" y="230">模型 / 工具调用均为 0</text>
+
+  <path class="edge" d="M 280 155 H 366"/>
+  <path class="edge-green" d="M 586 207 H 650"/>
+  <text class="edge-label" x="606" y="192">hit</text>
+  <path class="edge-green" d="M 870 207 H 934"/>
+
+  <rect class="lane" x="54" y="402" width="1330" height="294"/>
+  <text class="lane-title" x="86" y="442">短期记忆 · LangGraph SQLite checkpointer</text>
+
+  <rect class="short" x="88" y="478" width="242" height="104"/>
+  <text class="node-title" x="209" y="510">会话上下文</text>
+  <text class="detail" x="209" y="535">最近轮次 + 结构化摘要</text>
+  <text class="detail" x="209" y="557">last successful focus</text>
+
+  <rect class="agent" x="394" y="478" width="252" height="104"/>
+  <text class="node-title" x="520" y="510">Agent StateGraph</text>
+  <text class="detail" x="520" y="535">Planner → Researcher</text>
+  <text class="detail" x="520" y="557">→ Visualizer</text>
+
+  <rect class="verified" x="710" y="478" width="230" height="104"/>
+  <text class="node-title" x="825" y="510">已验证 query graph</text>
+  <text class="detail" x="825" y="535">records + Evidence</text>
+  <text class="detail" x="825" y="557">完整 focus</text>
+
+  <rect class="short" x="1004" y="478" width="242" height="104"/>
+  <text class="node-title" x="1125" y="510">合并与压缩</text>
+  <text class="detail" x="1125" y="535">最多 15 轮</text>
+  <text class="detail" x="1125" y="557">压缩最旧 10，保留最新 5</text>
+
+  <path class="edge" d="M 330 530 H 394"/>
+  <path class="edge" d="M 646 530 H 710"/>
+  <path class="edge" d="M 940 530 H 1004"/>
+  <path class="edge" d="M 1125 582 V 636 H 209 V 582"/>
+  <text class="edge-label" x="634" y="652">下一轮按 conversation_id 恢复</text>
+
+  <path class="edge" d="M 476 248 V 336 H 520 V 478"/>
+  <text class="edge-label" x="486" y="335">miss</text>
+
+  <rect class="long" x="1214" y="166" width="138" height="82"/>
+  <text class="node-title" x="1283" y="197">写入策略</text>
+  <text class="detail" x="1283" y="222">ADD / SKIP</text>
+  <path class="edge-green" d="M 825 478 V 316 H 1283 V 248"/>
+  <path class="edge-green" d="M 1214 207 H 870"/>
+  <text class="edge-label" x="1144" y="302">非空 · Evidence 完整 · 无歧义 · 非实时</text>
+
+  <rect class="skip" x="1190" y="612" width="164" height="54"/>
+  <text class="node-title" x="1272" y="645">失败等情况 SKIP</text>
+  <path class="edge" d="M 1283 248 V 612"/>
+
+  <text class="subtitle" x="56" y="732">上下文型缓存绑定 conversation_id；失败或澄清轮不会覆盖最后一次成功 focus。</text>
+</svg>

@@ -32,6 +32,7 @@ def canonical_query_id(
     data_version: str,
     graph_schema_version: int,
     permission_scope: str,
+    conversation_owner_hash: str | None = None,
 ) -> str:
     payload = {
         "signature": signature.model_dump(mode="json", exclude_none=True),
@@ -39,6 +40,11 @@ def canonical_query_id(
         "graph_schema_version": graph_schema_version,
         "permission_scope": permission_scope,
     }
+    # Context-free IDs intentionally retain their historical shape.  A
+    # conversation-scoped result receives an opaque owner binding so an otherwise
+    # identical signature cannot overwrite or hydrate another conversation's row.
+    if conversation_owner_hash is not None:
+        payload["conversation_owner_hash"] = conversation_owner_hash
     return f"canonical:{stable_hash(payload)}"
 
 

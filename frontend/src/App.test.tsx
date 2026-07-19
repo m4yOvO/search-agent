@@ -123,7 +123,7 @@ const FIRST_RESPONSE = {
     },
     route_history: ["planner", "researcher", "visualizer"]
   },
-  disclaimer: "结果来自本地演示数据，不代表实时工商或法律结论。"
+  disclaimer: ""
 };
 
 function jsonResponse(body: unknown = FIRST_RESPONSE): Response {

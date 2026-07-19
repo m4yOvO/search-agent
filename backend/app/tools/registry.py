@@ -15,6 +15,9 @@ from app.tools.contracts import (
     FUZZY_MIN_MARGIN,
     CompaniesRequest,
     CompanyAttribute,
+    EntityMatchProof,
+    EntityQueryMatchMeta,
+    MatchKind,
     MatchMode,
     PersonsRequest,
     RelationDirection,
@@ -28,14 +31,16 @@ from app.tools.specs import ToolHandlerOutput, ToolSpec, create_tool_spec
 
 
 PERSONS_DESCRIPTION = (
-    "只在 person 1.json 中检索可验证的人物记录。先使用 match_mode=exact；仅在精确"
-    "检索为空后使用 match_mode=fuzzy。query 可以是 Planner 从动态实体目录选择的标准名；"
-    "工具本身只比较原始名称，不翻译、不添加别名，也不猜测 ID。"
+    "只在 person 1.json 中检索可验证的人物记录。解析顺序为用户原 mention 的 exact、"
+    "原 mention 的 fuzzy，最后才是 Planner 动态目录标准名的 cross_language_exact。"
+    "query/queries 保持单项与批量兼容；query_rewrites 为每项保留原 mention 和标准名，"
+    "工具逐项返回独立证明。工具只比较原始名称，不翻译、不添加别名，也不猜测 ID。"
 )
 COMPANIES_DESCRIPTION = (
-    "只在 company 1.json 中检索可验证的企业记录，并可按参数返回原始总部关系。先使用"
-    " match_mode=exact，仅在精确检索为空后使用 fuzzy。query 可以是 Planner 从动态实体"
-    "目录选择的标准名；工具不翻译名称、不添加别名，也不猜测 ID。"
+    "只在 company 1.json 中检索可验证的企业记录，并可按参数返回原始总部关系。解析顺序"
+    "为用户原 mention 的 exact、原 mention 的 fuzzy，最后才是 Planner 动态实体目录标准名"
+    "的 cross_language_exact。query/queries 保持单项与批量兼容；query_rewrites 为每项保留"
+    "原 mention 和标准名并返回独立证明。工具不翻译名称、不添加别名，也不猜测 ID。"
 )
 RELATIONS_DESCRIPTION = (
     "只查询 relations 1.json，不推断关系。一个 ID 或类型列表内部采用 OR，不同非空过滤"
@@ -153,22 +158,24 @@ class ToolRegistry:
 
     async def _handle_persons(self, request: PersonsRequest) -> ToolHandlerOutput:
         await asyncio.sleep(0)
-        page = self.repository.search_entities_page(
+        pages = self._entity_search_pages(
             node_type=NodeType.PERSON,
-            query=request.query,
+            lookups=request.lookup_pairs,
             entity_ids=request.person_ids,
             match_mode=request.match_mode,
             limit=request.limit,
         )
         attributes = [attribute.value for attribute in request.attributes]
-        records = [
-            self.repository.node_record(node, attributes) for node in page.nodes
-        ]
+        records = _deduplicate_records(
+            self.repository.node_record(node, attributes)
+            for _, _, page in pages
+            for node in page.nodes
+        )
         evidence = self.repository.evidence_for_records(records)
         return ToolHandlerOutput(
             records=tuple(records),
             evidence=tuple(evidence),
-            meta=_entity_meta(request.match_mode, page),
+            meta=_entity_meta(request.match_mode, pages),
         )
 
     async def _handle_companies(
@@ -176,9 +183,9 @@ class ToolRegistry:
         request: CompaniesRequest,
     ) -> ToolHandlerOutput:
         await asyncio.sleep(0)
-        page = self.repository.search_entities_page(
+        pages = self._entity_search_pages(
             node_type=NodeType.COMPANY,
-            query=request.query,
+            lookups=request.lookup_pairs,
             entity_ids=request.company_ids,
             match_mode=request.match_mode,
             limit=request.limit,
@@ -188,17 +195,21 @@ class ToolRegistry:
             for attribute in request.attributes
             if attribute != CompanyAttribute.LOCATION
         ]
+        selected_nodes = {
+            node.id: node for _, _, page in pages for node in page.nodes
+        }
         records = [
-            self.repository.node_record(node, attributes) for node in page.nodes
+            self.repository.node_record(selected_nodes[node_id], attributes)
+            for node_id in sorted(selected_nodes)
         ]
 
         include_headquarters = (
             request.include_headquarters
             or CompanyAttribute.LOCATION in request.attributes
         )
-        if include_headquarters and page.nodes:
+        if include_headquarters and selected_nodes:
             headquarters = self.repository.query_relations(
-                subject_ids=[node.id for node in page.nodes],
+                subject_ids=selected_nodes,
                 relation_types=[RelationType.HEADQUARTERED_IN],
                 direction=RelationDirection.OUTGOING,
                 limit=200,
@@ -212,7 +223,49 @@ class ToolRegistry:
         return ToolHandlerOutput(
             records=tuple(records),
             evidence=tuple(evidence),
-            meta=_entity_meta(request.match_mode, page),
+            meta=_entity_meta(request.match_mode, pages),
+        )
+
+    def _entity_search_pages(
+        self,
+        *,
+        node_type: NodeType,
+        lookups: tuple[tuple[str, str], ...],
+        entity_ids: Iterable[str],
+        match_mode: MatchMode,
+        limit: int,
+    ) -> tuple[tuple[str | None, str | None, EntitySearchPage], ...]:
+        """Execute each batch member independently against the same ID scope."""
+
+        effective_lookups: tuple[tuple[str | None, str | None], ...] = (
+            lookups or ((None, None),)
+        )
+        repository_mode = (
+            MatchMode.EXACT
+            if match_mode is MatchMode.CROSS_LANGUAGE_EXACT
+            else match_mode
+        )
+        return tuple(
+            (
+                original_query,
+                effective_query,
+                _audited_rewrite_page(
+                    self.repository.search_entities_page(
+                        node_type=node_type,
+                        query=effective_query,
+                        entity_ids=entity_ids,
+                        match_mode=repository_mode,
+                        limit=limit,
+                    ),
+                    original_query=original_query,
+                    rewritten_query=(
+                        effective_query
+                        if match_mode is MatchMode.CROSS_LANGUAGE_EXACT
+                        else None
+                    ),
+                ),
+            )
+            for original_query, effective_query in effective_lookups
         )
 
     async def _handle_relations(self, request: RelationsRequest) -> ToolHandlerOutput:
@@ -288,19 +341,72 @@ class ToolRegistry:
 
 def _entity_meta(
     match_mode: MatchMode,
-    page: EntitySearchPage,
+    pages: tuple[tuple[str | None, str | None, EntitySearchPage], ...],
 ) -> ToolResultMeta:
+    total = sum(page.total for _, _, page in pages)
+    returned = sum(len(page.nodes) for _, _, page in pages)
+    query_matches = [
+        EntityQueryMatchMeta(
+            query=query,
+            rewritten_query=(
+                effective_query
+                if match_mode is MatchMode.CROSS_LANGUAGE_EXACT
+                else None
+            ),
+            match_mode=match_mode,
+            matched_entity_ids=[node.id for node in page.nodes],
+            match_proofs=list(page.match_proofs),
+            total=page.total,
+            returned=len(page.nodes),
+            truncated=page.truncated,
+            ambiguous=page.ambiguous,
+        )
+        for query, effective_query, page in pages
+        if query is not None
+    ]
     return ToolResultMeta(
-        total=page.total,
-        returned=len(page.nodes),
-        truncated=page.truncated,
+        total=total,
+        returned=returned,
+        truncated=returned < total,
         match_mode=match_mode,
-        match_proofs=list(page.match_proofs),
-        ambiguous=page.ambiguous,
+        match_proofs=[
+            proof for _, _, page in pages for proof in page.match_proofs
+        ],
+        query_matches=query_matches,
+        ambiguous=any(page.ambiguous for _, _, page in pages),
         acceptance_threshold=(
             FUZZY_ACCEPT_THRESHOLD if match_mode is MatchMode.FUZZY else None
         ),
         minimum_margin=FUZZY_MIN_MARGIN if match_mode is MatchMode.FUZZY else None,
+    )
+
+
+def _audited_rewrite_page(
+    page: EntitySearchPage,
+    *,
+    original_query: str | None,
+    rewritten_query: str | None,
+) -> EntitySearchPage:
+    """Attach a non-factual rewrite proof without changing raw matched records."""
+
+    if original_query is None or rewritten_query is None:
+        return page
+    return EntitySearchPage(
+        nodes=page.nodes,
+        match_proofs=tuple(
+            EntityMatchProof(
+                entity_id=proof.entity_id,
+                query=original_query,
+                rewritten_query=rewritten_query,
+                matched_text=proof.matched_text,
+                kind=MatchKind.CROSS_LANGUAGE_EXACT,
+                score=proof.score,
+            )
+            for proof in page.match_proofs
+        ),
+        total=page.total,
+        truncated=page.truncated,
+        ambiguous=page.ambiguous,
     )
 
 

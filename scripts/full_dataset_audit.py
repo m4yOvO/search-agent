@@ -6,12 +6,17 @@ talks only to the public Docker HTTP API.  Running it without ``--execute`` prin
 the bounded plan and performs no network request, which keeps pytest and accidental
 shell invocations free of paid model calls.
 
+Executed runs atomically checkpoint bounded, query-free progress.  A checkpoint is
+diagnostic evidence, not a resume manifest: rerunning an interrupted multi-turn audit
+must use a fresh cache namespace so conversation and raw-cache semantics are replayed.
+
 Examples::
 
     python scripts/full_dataset_audit.py
     python scripts/full_dataset_audit.py --execute --concurrency 2
     python scripts/full_dataset_audit.py --execute --max-persons 3 \
-        --max-companies 3 --max-locations 3 --max-pairs 5
+        --max-companies 3 --max-locations 3 --max-pairs 5 \
+        --max-nary-triples 2 --max-nary-fives 1 --max-nary-tens 0
 """
 
 from __future__ import annotations
@@ -29,7 +34,7 @@ from collections import Counter, defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 from uuid import uuid4
 
 
@@ -75,6 +80,92 @@ SENSITIVE_MARKERS = (
     "CREDENTIAL",
     "AUTHORIZATION",
 )
+NARY_UNION_TEMPLATES = (
+    "{entities}分别有哪些关联公司？请合并结果。",
+    "请查询{entities}各自关联的企业，并给出并集。",
+    "综合来看，{entities}连接到哪些公司？",
+)
+PROFILE_TEMPLATES = (
+    "请展示{entity}的基础资料。",
+    "我想了解{entity}的实体信息。",
+)
+NARY_INTERSECTION_TEMPLATES = (
+    "{entities}共同关联到哪些公司？",
+    "请找出同时与{entities}存在直接关联的企业。",
+)
+NARY_DIRECT_TEMPLATES = (
+    "{entities}之间有哪些直接关系？只看这些实体内部。",
+    "请给出{entities}形成的内部直接关系图，不扩展一跳邻居。",
+    "仅查询{entities}彼此之间的关系。",
+)
+MULTI_GOAL_TEMPLATE = "请分别查询{entity}明确持有的公司，以及其任职的公司。"
+DEPENDENT_LOCATION_TEMPLATE = (
+    "先找出{entity}直接关联的全部公司，再查询这些公司的总部地点。"
+)
+PROFILE_SUITES = frozenset({"person_profiles", "company_profiles"})
+SEMANTIC_SUITES = frozenset(
+    {
+        "nary_intersection_3",
+        "nary_intersection_5",
+        "nary_direct_3",
+        "nary_direct_5",
+        "nary_direct_10",
+        "multi_goal_empty_nonempty",
+        "dependent_goal_location",
+    }
+)
+TRACE_COUNTER_FIELDS = (
+    "model_calls",
+    "planner_model_calls",
+    "researcher_model_calls",
+    "visualizer_model_calls",
+    "tool_calls",
+    "research_steps",
+    "replans",
+)
+REPORT_RESULT_FIELDS = frozenset(
+    {
+        "case_id",
+        "suite",
+        "passed",
+        "error",
+        "request_id",
+        "response_status",
+        "response_error_code",
+        "expected_nodes",
+        "expected_edges",
+        "actual_nodes",
+        "actual_edges",
+        "cache_hit",
+        "cache_match_type",
+        "focus_company_count",
+        "tool_result_counts",
+        "verified_relation_rows",
+        *TRACE_COUNTER_FIELDS,
+    }
+)
+REPORT_AGENT_STEP_FIELDS = frozenset(
+    {
+        "role",
+        "action",
+        "tool",
+        "association_operator",
+        "relation_types",
+        "result_merge",
+        "resolution_strategy",
+        "resolution_version",
+        "record_ids",
+        "argument_fingerprint",
+        "count",
+        "error_code",
+        "goal_id",
+    }
+)
+LOCATION_FOLLOWUP_TEMPLATES = (
+    "这些公司在哪？",
+    "它们分别位于哪些城市？",
+    "上述关联企业的总部在哪里？",
+)
 
 
 class AuditFailure(AssertionError):
@@ -113,10 +204,27 @@ class AuditCase:
     expected_nodes: tuple[ExpectedNode, ...]
     expected_edges: tuple[ExpectedEdge, ...]
     required_tools: tuple[str, ...]
+    expected_cache_hit: bool | None = None
+    expected_result_merge: str | None = None
+    seed_entity_ids: tuple[str, ...] = ()
+    focus_company_ids: tuple[str, ...] = ()
+    require_batch_entity_tools: bool = False
+    expected_tool_calls: int | None = None
+    expected_tool_result_counts: tuple[tuple[str, int], ...] = ()
+    expected_relation_scopes: tuple[tuple[str, ...], ...] = ()
+    relation_result_required: bool = True
 
     @property
     def is_empty(self) -> bool:
-        return not self.expected_edges
+        return self.relation_result_required and not self.expected_edges
+
+
+@dataclass(frozen=True)
+class AuditConversation:
+    conversation_id: str
+    entity_count: int
+    seed_entity_ids: tuple[str, ...]
+    steps: tuple[AuditCase, ...]
 
 
 @dataclass(frozen=True)
@@ -252,6 +360,234 @@ class RawDataset:
             cases = tuple(case for case in cases if not case.is_empty)
         return tuple(cases)
 
+    def build_extended_cases(
+        self,
+        *,
+        max_person_profiles: int | None = None,
+        max_company_profiles: int | None = None,
+        max_intersections: int = 2,
+        max_direct_groups: int = 3,
+        max_multi_goal: int = 1,
+        max_dependent_location: int = 1,
+        skip_empty: bool = False,
+    ) -> tuple[AuditCase, ...]:
+        """Build profile and non-union semantic cases from the raw graph.
+
+        The limits bound paid HTTP work only.  Entity membership, result rows, and
+        expected provenance are always derived from the three raw arrays; no
+        acceptance entity or source row is named here.
+        """
+
+        limits = (
+            max_intersections,
+            max_direct_groups,
+            max_multi_goal,
+            max_dependent_location,
+        )
+        if any(limit < 0 for limit in limits):
+            raise AuditFailure("extended_limit_must_be_nonnegative")
+        profiles = (
+            *self._person_profile_cases()[:max_person_profiles],
+            *self._company_profile_cases()[:max_company_profiles],
+        )
+        semantic = (
+            *self._intersection_cases()[:max_intersections],
+            *self._direct_cases()[:max_direct_groups],
+            *self._multi_goal_cases()[:max_multi_goal],
+            *self._dependent_location_cases()[:max_dependent_location],
+        )
+        cases = (*profiles, *semantic)
+        if skip_empty:
+            cases = tuple(case for case in cases if not case.is_empty)
+        return tuple(cases)
+
+    def build_nary_conversations(
+        self,
+        *,
+        max_triples: int = 20,
+        max_fives: int = 10,
+        max_tens: int = 2,
+    ) -> tuple[AuditConversation, ...]:
+        """Build deterministic N-entity union/follow-up/cache conversations.
+
+        Entity membership comes only from a stable walk over the raw business
+        relationship graph.  Query wording changes presentation, never expected
+        facts.  Every conversation remains sequential while separate conversations
+        may be executed concurrently.
+        """
+
+        limits = ((3, max_triples), (5, max_fives), (10, max_tens))
+        if any(limit < 0 for _, limit in limits):
+            raise AuditFailure("nary_limit_must_be_nonnegative")
+        walk = self._business_graph_walk()
+        output: list[AuditConversation] = []
+        for entity_count, limit in limits:
+            for number, seed_ids in enumerate(
+                self._graph_groups(walk, entity_count, limit),
+                start=1,
+            ):
+                union_edges, focus_company_ids = self._union_projection(seed_ids)
+                if not union_edges or not focus_company_ids:
+                    raise AuditFailure(
+                        f"nary_union_must_be_nonempty:{entity_count}:{number}"
+                    )
+                location_edges = self._headquarters_edges(focus_company_ids)
+                union_nodes = self._case_nodes(seed_ids, union_edges)
+                session_edges = tuple(sorted({*union_edges, *location_edges}))
+                session_nodes = self._case_nodes(seed_ids, session_edges)
+                labels = tuple(self.nodes[entity_id].label for entity_id in seed_ids)
+                union_message = _nary_union_message(labels, number - 1)
+                location_message = _location_followup_message(number - 1)
+                required_entity_tools = {
+                    "persons" if entity_id.startswith("person:") else "companies"
+                    for entity_id in seed_ids
+                }
+                required_tools = tuple(sorted({*required_entity_tools, "relations"}))
+                prefix = f"nary-{entity_count}-{number:03d}"
+                union_case = AuditCase(
+                    case_id=f"{prefix}-union",
+                    suite=f"nary_union_{entity_count}",
+                    message=union_message,
+                    expected_nodes=union_nodes,
+                    expected_edges=union_edges,
+                    required_tools=required_tools,
+                    expected_cache_hit=False,
+                    expected_result_merge="union",
+                    seed_entity_ids=seed_ids,
+                    focus_company_ids=focus_company_ids,
+                    require_batch_entity_tools=True,
+                    expected_tool_calls=len(required_tools),
+                )
+                location_case = AuditCase(
+                    case_id=f"{prefix}-locations",
+                    suite=f"nary_locations_{entity_count}",
+                    message=location_message,
+                    expected_nodes=session_nodes,
+                    expected_edges=session_edges,
+                    required_tools=("relations",),
+                    expected_cache_hit=False,
+                    expected_result_merge="not_applicable",
+                    seed_entity_ids=focus_company_ids,
+                    focus_company_ids=focus_company_ids,
+                    expected_tool_calls=1,
+                )
+                repeat_case = AuditCase(
+                    case_id=f"{prefix}-raw-repeat",
+                    suite=f"nary_cache_{entity_count}",
+                    message=union_message,
+                    expected_nodes=session_nodes,
+                    expected_edges=session_edges,
+                    required_tools=(),
+                    expected_cache_hit=True,
+                    expected_result_merge=None,
+                    seed_entity_ids=seed_ids,
+                    focus_company_ids=focus_company_ids,
+                    expected_tool_calls=0,
+                )
+                output.append(
+                    AuditConversation(
+                        conversation_id=prefix,
+                        entity_count=entity_count,
+                        seed_entity_ids=seed_ids,
+                        steps=(union_case, location_case, repeat_case),
+                    )
+                )
+        return tuple(output)
+
+    def _business_graph_walk(self) -> tuple[str, ...]:
+        adjacency: defaultdict[str, set[str]] = defaultdict(set)
+        for edge in self.edges:
+            if edge.raw_relation not in BUSINESS_RELATIONS:
+                continue
+            if (
+                edge.source not in self.base_entity_ids
+                or edge.target not in self.base_entity_ids
+            ):
+                continue
+            adjacency[edge.source].add(edge.target)
+            adjacency[edge.target].add(edge.source)
+        if len(adjacency) < 10:
+            raise AuditFailure("business_graph_has_too_few_entities")
+
+        order: list[str] = []
+        unseen = set(adjacency)
+        while unseen:
+            start = min(unseen, key=lambda item: (-len(adjacency[item]), item))
+            queue = [start]
+            queued = {start}
+            while queue:
+                current = queue.pop(0)
+                if current not in unseen:
+                    continue
+                unseen.remove(current)
+                order.append(current)
+                neighbours = sorted(
+                    (adjacency[current] & unseen) - queued,
+                    key=lambda item: (-len(adjacency[item]), item),
+                )
+                queue.extend(neighbours)
+                queued.update(neighbours)
+        return tuple(order)
+
+    @staticmethod
+    def _graph_groups(
+        walk: Sequence[str],
+        entity_count: int,
+        limit: int,
+    ) -> tuple[tuple[str, ...], ...]:
+        if limit == 0:
+            return ()
+        if entity_count < 1 or len(walk) < entity_count:
+            raise AuditFailure(f"nary_group_size_unavailable:{entity_count}")
+        groups: list[tuple[str, ...]] = []
+        seen: set[frozenset[str]] = set()
+        for start in range(len(walk)):
+            group = tuple(
+                walk[(start + offset) % len(walk)]
+                for offset in range(entity_count)
+            )
+            key = frozenset(group)
+            if len(key) != entity_count or key in seen:
+                continue
+            seen.add(key)
+            groups.append(group)
+            if len(groups) == limit:
+                return tuple(groups)
+        raise AuditFailure(
+            f"nary_group_count_unavailable:{entity_count}:{limit}:{len(groups)}"
+        )
+
+    def _union_projection(
+        self,
+        seed_ids: Sequence[str],
+    ) -> tuple[tuple[ExpectedEdge, ...], tuple[str, ...]]:
+        selected_edges: set[ExpectedEdge] = set()
+        focus_company_ids: set[str] = set()
+        for subject_id in seed_ids:
+            for edge in self.edges:
+                if (
+                    edge.raw_relation not in BUSINESS_RELATIONS
+                    or subject_id not in {edge.source, edge.target}
+                ):
+                    continue
+                opposite = edge.target if edge.source == subject_id else edge.source
+                if not opposite.startswith("company:"):
+                    continue
+                selected_edges.add(edge)
+                focus_company_ids.add(opposite)
+        return tuple(sorted(selected_edges)), tuple(sorted(focus_company_ids))
+
+    def _headquarters_edges(
+        self,
+        company_ids: Iterable[str],
+    ) -> tuple[ExpectedEdge, ...]:
+        selected = set(company_ids)
+        return tuple(
+            edge
+            for edge in self.edges
+            if edge.raw_relation == "Headquartered_in" and edge.source in selected
+        )
+
     def _case_nodes(
         self,
         seed_ids: Iterable[str],
@@ -261,6 +597,284 @@ class RawDataset:
         for edge in edges:
             ids.update((edge.source, edge.target))
         return tuple(sorted(self.nodes[entity_id] for entity_id in ids))
+
+    @staticmethod
+    def _entity_tool(entity_id: str) -> str:
+        return "persons" if entity_id.startswith("person:") else "companies"
+
+    def _required_tools(self, entity_ids: Iterable[str]) -> tuple[str, ...]:
+        return tuple(
+            sorted({*(self._entity_tool(entity_id) for entity_id in entity_ids), "relations"})
+        )
+
+    def _company_neighbour_edges(
+        self, subject_id: str
+    ) -> dict[str, tuple[ExpectedEdge, ...]]:
+        grouped: defaultdict[str, list[ExpectedEdge]] = defaultdict(list)
+        for edge in self.edges:
+            if (
+                edge.raw_relation not in BUSINESS_RELATIONS
+                or subject_id not in {edge.source, edge.target}
+            ):
+                continue
+            neighbour = edge.target if edge.source == subject_id else edge.source
+            if neighbour.startswith("company:"):
+                grouped[neighbour].append(edge)
+        return {
+            entity_id: tuple(sorted(rows))
+            for entity_id, rows in grouped.items()
+        }
+
+    def _person_profile_cases(self) -> tuple[AuditCase, ...]:
+        return tuple(
+            self._profile_case(
+                entity_id=f"person:{row['id']}",
+                suite="person_profiles",
+                variant=index,
+            )
+            for index, row in enumerate(self.persons)
+        )
+
+    def _company_profile_cases(self) -> tuple[AuditCase, ...]:
+        return tuple(
+            self._profile_case(
+                entity_id=f"company:{row['id']}",
+                suite="company_profiles",
+                variant=index,
+            )
+            for index, row in enumerate(self.companies)
+        )
+
+    def _profile_case(
+        self,
+        *,
+        entity_id: str,
+        suite: str,
+        variant: int,
+    ) -> AuditCase:
+        tool = self._entity_tool(entity_id)
+        node = self.nodes[entity_id]
+        return AuditCase(
+            case_id=f"profile-{entity_id.replace(':', '-')}",
+            suite=suite,
+            message=PROFILE_TEMPLATES[variant % len(PROFILE_TEMPLATES)].format(
+                entity=node.label
+            ),
+            expected_nodes=(node,),
+            expected_edges=(),
+            required_tools=(tool,),
+            expected_cache_hit=False,
+            expected_result_merge="not_applicable",
+            seed_entity_ids=(entity_id,),
+            require_batch_entity_tools=True,
+            expected_tool_calls=1,
+            expected_tool_result_counts=((tool, 1),),
+            relation_result_required=False,
+        )
+
+    def _intersection_cases(self) -> tuple[AuditCase, ...]:
+        cases: list[AuditCase] = []
+        # The raw graph has common-neighbour sets large enough for N=3 and N=5.
+        # The selection algorithm remains valid for any future source data and
+        # fails explicitly if the raw graph no longer supports the requested size.
+        for variant, entity_count in enumerate((3, 5)):
+            candidates: list[tuple[int, str, tuple[str, ...]]] = []
+            for company_id in sorted(
+                entity_id
+                for entity_id in self.base_entity_ids
+                if entity_id.startswith("company:")
+            ):
+                subjects = tuple(
+                    sorted(
+                        subject_id
+                        for subject_id in self.base_entity_ids
+                        if subject_id != company_id
+                        and company_id in self._company_neighbour_edges(subject_id)
+                    )
+                )
+                if len(subjects) >= entity_count:
+                    candidates.append((-len(subjects), company_id, subjects))
+            if not candidates:
+                raise AuditFailure(f"intersection_group_unavailable:{entity_count}")
+            _rank, _target, available = min(candidates)
+            seed_ids = available[:entity_count]
+            memberships = [self._company_neighbour_edges(item) for item in seed_ids]
+            common = set.intersection(*(set(item) for item in memberships))
+            selected_edges = tuple(
+                sorted(
+                    {
+                        edge
+                        for item in memberships
+                        for company_id, rows in item.items()
+                        if company_id in common
+                        for edge in rows
+                    }
+                )
+            )
+            if not common or not selected_edges:
+                raise AuditFailure(f"intersection_projection_empty:{entity_count}")
+            labels = [self.nodes[entity_id].label for entity_id in seed_ids]
+            required_tools = self._required_tools(seed_ids)
+            entity_tool_counts = tuple(
+                (tool, 1) for tool in required_tools if tool != "relations"
+            )
+            cases.append(
+                AuditCase(
+                    case_id=f"intersection-{entity_count}",
+                    suite=f"nary_intersection_{entity_count}",
+                    message=NARY_INTERSECTION_TEMPLATES[
+                        variant % len(NARY_INTERSECTION_TEMPLATES)
+                    ].format(entities="、".join(labels)),
+                    expected_nodes=self._case_nodes(seed_ids, selected_edges),
+                    expected_edges=selected_edges,
+                    required_tools=required_tools,
+                    expected_cache_hit=False,
+                    expected_result_merge="intersection",
+                    seed_entity_ids=seed_ids,
+                    focus_company_ids=tuple(sorted(common)),
+                    require_batch_entity_tools=True,
+                    expected_tool_calls=len(required_tools),
+                    expected_tool_result_counts=(*entity_tool_counts, ("relations", 1)),
+                    expected_relation_scopes=((),),
+                )
+            )
+        return tuple(cases)
+
+    def _direct_cases(self) -> tuple[AuditCase, ...]:
+        walk = self._business_graph_walk()
+        business_edges = [
+            edge
+            for edge in self.edges
+            if edge.raw_relation in BUSINESS_RELATIONS
+            and edge.source in self.base_entity_ids
+            and edge.target in self.base_entity_ids
+            and edge.source != edge.target
+        ]
+        if not business_edges:
+            raise AuditFailure("direct_seed_edge_unavailable")
+        cases: list[AuditCase] = []
+        used: set[frozenset[str]] = set()
+        for variant, entity_count in enumerate((3, 5, 10)):
+            chosen: tuple[str, ...] | None = None
+            for seed_edge in business_edges[variant:] + business_edges[:variant]:
+                ordered = [seed_edge.source, seed_edge.target]
+                ordered.extend(item for item in walk if item not in ordered)
+                candidate = tuple(ordered[:entity_count])
+                key = frozenset(candidate)
+                if len(key) == entity_count and key not in used:
+                    chosen = candidate
+                    used.add(key)
+                    break
+            if chosen is None:
+                raise AuditFailure(f"direct_group_unavailable:{entity_count}")
+            selected_edges = tuple(
+                edge
+                for edge in self.edges
+                if edge.raw_relation in BUSINESS_RELATIONS
+                and edge.source in chosen
+                and edge.target in chosen
+            )
+            if not selected_edges:
+                raise AuditFailure(f"direct_projection_empty:{entity_count}")
+            required_tools = self._required_tools(chosen)
+            entity_tool_counts = tuple(
+                (tool, 1) for tool in required_tools if tool != "relations"
+            )
+            cases.append(
+                AuditCase(
+                    case_id=f"direct-{entity_count}",
+                    suite=f"nary_direct_{entity_count}",
+                    message=NARY_DIRECT_TEMPLATES[
+                        variant % len(NARY_DIRECT_TEMPLATES)
+                    ].format(
+                        entities="、".join(self.nodes[item].label for item in chosen)
+                    ),
+                    expected_nodes=self._case_nodes(chosen, selected_edges),
+                    expected_edges=selected_edges,
+                    required_tools=required_tools,
+                    expected_cache_hit=False,
+                    expected_result_merge="direct",
+                    seed_entity_ids=chosen,
+                    focus_company_ids=tuple(
+                        sorted(item for item in chosen if item.startswith("company:"))
+                    ),
+                    require_batch_entity_tools=True,
+                    expected_tool_calls=len(required_tools),
+                    expected_tool_result_counts=(*entity_tool_counts, ("relations", 1)),
+                    expected_relation_scopes=((),),
+                )
+            )
+        return tuple(cases)
+
+    def _multi_goal_cases(self) -> tuple[AuditCase, ...]:
+        cases: list[AuditCase] = []
+        for row in self.persons:
+            subject_id = f"person:{row['id']}"
+            role_edges = tuple(
+                edge
+                for edge in self.edges
+                if edge.source == subject_id
+                and edge.relation_type == "works_at"
+                and edge.target.startswith("company:")
+            )
+            owns_edges = tuple(
+                edge
+                for edge in self.edges
+                if edge.source == subject_id and edge.relation_type == "owns"
+            )
+            if not role_edges or owns_edges:
+                continue
+            cases.append(
+                AuditCase(
+                    case_id=f"multi-goal-empty-nonempty-{row['id']}",
+                    suite="multi_goal_empty_nonempty",
+                    message=MULTI_GOAL_TEMPLATE.format(entity=row["name"]),
+                    expected_nodes=self._case_nodes((subject_id,), role_edges),
+                    expected_edges=role_edges,
+                    required_tools=("persons", "relations"),
+                    expected_cache_hit=False,
+                    expected_result_merge="not_applicable",
+                    seed_entity_ids=(subject_id,),
+                    require_batch_entity_tools=True,
+                    expected_tool_calls=3,
+                    expected_tool_result_counts=(("persons", 1), ("relations", 2)),
+                    expected_relation_scopes=(("owns",), ("works_at",)),
+                )
+            )
+        if not cases:
+            raise AuditFailure("multi_goal_empty_nonempty_unavailable")
+        return tuple(cases)
+
+    def _dependent_location_cases(self) -> tuple[AuditCase, ...]:
+        cases: list[AuditCase] = []
+        for row in self.persons:
+            subject_id = f"person:{row['id']}"
+            business_edges, company_ids = self._union_projection((subject_id,))
+            location_edges = self._headquarters_edges(company_ids)
+            if not business_edges or not company_ids or not location_edges:
+                continue
+            selected_edges = tuple(sorted({*business_edges, *location_edges}))
+            cases.append(
+                AuditCase(
+                    case_id=f"dependent-location-{row['id']}",
+                    suite="dependent_goal_location",
+                    message=DEPENDENT_LOCATION_TEMPLATE.format(entity=row["name"]),
+                    expected_nodes=self._case_nodes((subject_id,), selected_edges),
+                    expected_edges=selected_edges,
+                    required_tools=("persons", "relations"),
+                    expected_cache_hit=False,
+                    expected_result_merge="not_applicable",
+                    seed_entity_ids=(subject_id,),
+                    focus_company_ids=company_ids,
+                    require_batch_entity_tools=True,
+                    expected_tool_calls=3,
+                    expected_tool_result_counts=(("persons", 1), ("relations", 2)),
+                    expected_relation_scopes=((), ("headquartered_in",)),
+                )
+            )
+        if not cases:
+            raise AuditFailure("dependent_location_goal_unavailable")
+        return tuple(cases)
 
     def _person_cases(self) -> tuple[AuditCase, ...]:
         output: list[AuditCase] = []
@@ -355,7 +969,7 @@ class RawDataset:
             groups[frozenset((edge.source, edge.target))].append(edge)
 
         output: list[AuditCase] = []
-        for number, (pair, rows) in enumerate(
+        for number, (pair, _seed_rows) in enumerate(
             sorted(groups.items(), key=lambda item: tuple(sorted(item[0]))), start=1
         ):
             ids = tuple(sorted(pair))
@@ -367,7 +981,22 @@ class RawDataset:
             required = {"relations"}
             for entity_id in ids:
                 required.add("persons" if entity_id.startswith("person:") else "companies")
-            edges = tuple(sorted(rows))
+            # ``direct`` is an induced-subgraph operation: once the seed set is
+            # chosen, every business edge whose two endpoints belong to that
+            # set is part of the result.  Re-filter from the lossless raw edge
+            # projection instead of reusing the endpoint-group rows that only
+            # established which pair cases exist.  This deliberately retains
+            # duplicate rows and self-relations on either seed.
+            seed_ids = frozenset(ids)
+            edges = tuple(
+                sorted(
+                    edge
+                    for edge in self.edges
+                    if edge.raw_relation in BUSINESS_RELATIONS
+                    and edge.source in seed_ids
+                    and edge.target in seed_ids
+                )
+            )
             output.append(
                 AuditCase(
                     case_id=f"pair-{number:03d}",
@@ -389,12 +1018,16 @@ class ApiClient:
     def get(self, path: str) -> dict[str, Any]:
         return self._request("GET", path, None)
 
-    def chat(self, case: AuditCase) -> dict[str, Any]:
+    def chat(
+        self,
+        case: AuditCase,
+        conversation_id: str | None = None,
+    ) -> dict[str, Any]:
         return self._request(
             "POST",
             "/chat",
             {
-                "conversation_id": str(uuid4()),
+                "conversation_id": conversation_id or str(uuid4()),
                 "message": case.message,
                 "locale": "zh-CN",
             },
@@ -521,15 +1154,7 @@ def validate_response(case: AuditCase, body: Mapping[str, Any]) -> dict[str, Any
         raise AuditFailure("missing_trace")
     counters = {
         key: _nonnegative_int(trace.get(key), key)
-        for key in (
-            "model_calls",
-            "planner_model_calls",
-            "researcher_model_calls",
-            "visualizer_model_calls",
-            "tool_calls",
-            "research_steps",
-            "replans",
-        )
+        for key in TRACE_COUNTER_FIELDS
     }
     if counters["model_calls"] != sum(
         counters[key]
@@ -540,23 +1165,45 @@ def validate_response(case: AuditCase, body: Mapping[str, Any]) -> dict[str, Any
         )
     ):
         raise AuditFailure("model_counter_mismatch")
-    if not isinstance(trace.get("route_history"), list):
+    route_history = trace.get("route_history")
+    if not isinstance(route_history, list):
         raise AuditFailure("missing_route_history")
 
     memory = body.get("memory") if isinstance(body.get("memory"), dict) else {}
     cache_hit = memory.get("cache_hit") is True
+    if case.expected_cache_hit is not None and cache_hit is not case.expected_cache_hit:
+        raise AuditFailure(
+            f"cache_expectation_mismatch:expected={case.expected_cache_hit}:actual={cache_hit}"
+        )
+    tool_result_counts: Counter[str] = Counter()
     if cache_hit:
         if counters["model_calls"] != 0 or counters["tool_calls"] != 0:
             raise AuditFailure("cache_hit_executed_agent_work")
+        if memory.get("match_type") != "raw_exact":
+            raise AuditFailure("repeat_query_did_not_use_raw_exact_cache")
     else:
         if (
             trace.get("researcher_invoked") is not True
-            or counters["planner_model_calls"] < 1
+            or not 2 <= counters["planner_model_calls"] <= 4
             or counters["researcher_model_calls"] < 1
             or counters["visualizer_model_calls"] < 1
             or counters["tool_calls"] < 1
         ):
             raise AuditFailure("fresh_trace_missing_agent_work")
+        analysis_indexes = [
+            index
+            for index, route in enumerate(route_history)
+            if route == "planner_analyze"
+        ]
+        task_indexes = [
+            index
+            for index, route in enumerate(route_history)
+            if route == "planner_tasks"
+        ]
+        if not analysis_indexes:
+            raise AuditFailure("fresh_trace_missing_planner_analysis")
+        if not task_indexes or min(task_indexes) <= min(analysis_indexes):
+            raise AuditFailure("fresh_trace_missing_planner_tasks")
         steps = trace.get("agent_steps")
         if not isinstance(steps, list):
             raise AuditFailure("missing_agent_steps")
@@ -571,6 +1218,54 @@ def validate_response(case: AuditCase, body: Mapping[str, Any]) -> dict[str, Any
         missing_tools = set(case.required_tools) - called_tools
         if missing_tools:
             raise AuditFailure(f"required_tool_missing:{_joined(missing_tools)}")
+        tool_result_steps = [
+            step
+            for step in steps
+            if isinstance(step, dict)
+            and step.get("role") == "researcher"
+            and step.get("action") == "tool_result"
+            and step.get("tool")
+        ]
+        tool_result_counts.update(str(step["tool"]) for step in tool_result_steps)
+        if case.expected_tool_result_counts:
+            actual_counts = Counter(str(step["tool"]) for step in tool_result_steps)
+            expected_counts = Counter(dict(case.expected_tool_result_counts))
+            if actual_counts != expected_counts:
+                raise AuditFailure(
+                    "tool_result_counts_mismatch:"
+                    f"expected={_counter_text(expected_counts)}:"
+                    f"actual={_counter_text(actual_counts)}"
+                )
+        if case.expected_relation_scopes:
+            actual_scopes = Counter(
+                tuple(sorted(_optional_string_list(step.get("relation_types"))))
+                for step in tool_result_steps
+                if step.get("tool") == "relations"
+            )
+            expected_scopes = Counter(case.expected_relation_scopes)
+            if actual_scopes != expected_scopes:
+                raise AuditFailure("relation_tool_scopes_mismatch")
+        if (
+            case.expected_tool_calls is not None
+            and counters["tool_calls"] != case.expected_tool_calls
+        ):
+            raise AuditFailure(
+                f"tool_call_count_mismatch:{case.expected_tool_calls}:{counters['tool_calls']}"
+            )
+        if case.expected_result_merge is not None:
+            planner_steps = [
+                step
+                for step in steps
+                if isinstance(step, dict)
+                and step.get("role") == "planner"
+                and step.get("action") == "plan"
+            ]
+            if len(planner_steps) != 1 or planner_steps[0].get(
+                "result_merge"
+            ) != case.expected_result_merge:
+                raise AuditFailure("planner_result_merge_mismatch")
+        if case.require_batch_entity_tools:
+            _validate_batch_entity_trace(case, steps)
 
     return {
         "case_id": case.case_id,
@@ -582,6 +1277,11 @@ def validate_response(case: AuditCase, body: Mapping[str, Any]) -> dict[str, Any
         "actual_edges": len(edges),
         "cache_hit": cache_hit,
         "cache_match_type": memory.get("match_type"),
+        "focus_company_count": len(case.focus_company_ids),
+        "tool_result_counts": dict(sorted(tool_result_counts.items())),
+        "verified_relation_rows": sorted(
+            {edge.source_row for edge in case.expected_edges}
+        ),
         **counters,
     }
 
@@ -591,25 +1291,19 @@ def execute_plan(
     client: ApiClient,
     cases: Sequence[AuditCase],
     concurrency: int,
+    on_case_complete: Callable[[int, dict[str, Any]], None] | None = None,
 ) -> list[dict[str, Any]]:
     """Run independent-conversation cases concurrently and preserve plan order."""
 
     results: list[dict[str, Any] | None] = [None] * len(cases)
 
     def run_one(index: int, case: AuditCase) -> tuple[int, dict[str, Any]]:
+        body: dict[str, Any] | None = None
         try:
             body = client.chat(case)
             return index, validate_response(case, body)
         except Exception as exc:  # every case should leave a bounded report row
-            error = _redact(str(exc))[:500] or type(exc).__name__
-            return index, {
-                "case_id": case.case_id,
-                "suite": case.suite,
-                "passed": False,
-                "error": error,
-                "expected_nodes": len(case.expected_nodes),
-                "expected_edges": len(case.expected_edges),
-            }
+            return index, _failure_row(case, exc, body)
 
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures: list[Future[tuple[int, dict[str, Any]]]] = [
@@ -619,13 +1313,421 @@ def execute_plan(
         for future in as_completed(futures):
             index, result = future.result()
             results[index] = result
+            if on_case_complete is not None:
+                on_case_complete(index, result)
             outcome = "PASS" if result["passed"] else "FAIL"
             print(f"{outcome} {result['case_id']}", file=sys.stderr, flush=True)
     return [result for result in results if result is not None]
 
 
-def plan_summary(cases: Sequence[AuditCase], dataset: RawDataset) -> dict[str, Any]:
+def execute_conversations(
+    *,
+    client: ApiClient,
+    conversations: Sequence[AuditConversation],
+    concurrency: int,
+    on_conversation_complete: (
+        Callable[[int, list[dict[str, Any]]], None] | None
+    ) = None,
+) -> list[dict[str, Any]]:
+    """Run each conversation in order while parallelizing only across conversations."""
+
+    results: list[list[dict[str, Any]] | None] = [None] * len(conversations)
+
+    def run_one(
+        index: int,
+        conversation: AuditConversation,
+    ) -> tuple[int, list[dict[str, Any]]]:
+        conversation_id = str(uuid4())
+        rows: list[dict[str, Any]] = []
+        for case in conversation.steps:
+            body: dict[str, Any] | None = None
+            try:
+                body = client.chat(case, conversation_id=conversation_id)
+                row = validate_response(case, body)
+            except Exception as exc:
+                row = _failure_row(case, exc, body)
+            rows.append(row)
+            outcome = "PASS" if row["passed"] else "FAIL"
+            print(f"{outcome} {row['case_id']}", file=sys.stderr, flush=True)
+        return index, rows
+
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures: list[Future[tuple[int, list[dict[str, Any]]]]] = [
+            executor.submit(run_one, index, conversation)
+            for index, conversation in enumerate(conversations)
+        ]
+        for future in as_completed(futures):
+            index, rows = future.result()
+            results[index] = rows
+            if on_conversation_complete is not None:
+                # Publish only an entirely attempted conversation.  A process
+                # interruption midway through the three-turn sequence must not
+                # make a later run look as though its follow-up/cache semantics
+                # were verified.
+                on_conversation_complete(index, rows)
+    return [row for rows in results if rows is not None for row in rows]
+
+
+def _failure_row(
+    case: AuditCase,
+    error: Exception,
+    body: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Keep enough safe execution metadata to diagnose a failed live case."""
+
+    response = body if isinstance(body, Mapping) else {}
+    trace = response.get("trace")
+    safe_trace: dict[str, Any] = {}
+    if isinstance(trace, Mapping):
+        for key in (
+            "model_calls",
+            "planner_model_calls",
+            "researcher_model_calls",
+            "visualizer_model_calls",
+            "tool_calls",
+            "research_steps",
+            "replans",
+            "route_history",
+            "agent_steps",
+        ):
+            if key in trace:
+                safe_trace[key] = trace[key]
+    return {
+        "case_id": case.case_id,
+        "suite": case.suite,
+        "passed": False,
+        "error": _redact(str(error))[:500] or type(error).__name__,
+        "request_id": response.get("request_id"),
+        "response_status": response.get("status"),
+        "response_error_code": response.get("error_code"),
+        "trace": safe_trace,
+        "expected_nodes": len(case.expected_nodes),
+        "expected_edges": len(case.expected_edges),
+        "tool_result_counts": _tool_result_counts(safe_trace.get("agent_steps")),
+        "verified_relation_rows": [],
+    }
+
+
+def _validate_batch_entity_trace(
+    case: AuditCase,
+    steps: Sequence[Any],
+) -> None:
+    planner_steps = [
+        step
+        for step in steps
+        if isinstance(step, dict)
+        and step.get("role") == "planner"
+        and step.get("action") == "plan"
+    ]
+    if len(planner_steps) != 1 or planner_steps[0].get("count") != len(
+        case.seed_entity_ids
+    ):
+        raise AuditFailure("planner_entity_count_mismatch")
+
+    expected_by_tool = {
+        "persons": {
+            entity_id
+            for entity_id in case.seed_entity_ids
+            if entity_id.startswith("person:")
+        },
+        "companies": {
+            entity_id
+            for entity_id in case.seed_entity_ids
+            if entity_id.startswith("company:")
+        },
+    }
+    for tool, expected_ids in expected_by_tool.items():
+        if not expected_ids:
+            continue
+        results = [
+            step
+            for step in steps
+            if isinstance(step, dict)
+            and step.get("role") == "researcher"
+            and step.get("action") == "tool_result"
+            and step.get("tool") == tool
+        ]
+        if len(results) != 1:
+            raise AuditFailure(f"entity_tool_not_batched:{tool}:{len(results)}")
+        result = results[0]
+        if result.get("resolution_strategy") != "exact":
+            raise AuditFailure(f"batch_entity_resolution_not_exact:{tool}")
+        if expected_ids - set(_optional_string_list(result.get("record_ids"))):
+            raise AuditFailure(f"batch_entity_ids_incomplete:{tool}")
+
+
+def _tool_result_counts(steps: Any) -> dict[str, int]:
+    if not isinstance(steps, list):
+        return {}
+    counts = Counter(
+        str(step["tool"])
+        for step in steps
+        if isinstance(step, Mapping)
+        and step.get("role") == "researcher"
+        and step.get("action") == "tool_result"
+        and step.get("tool") in {"persons", "companies", "relations"}
+    )
+    return dict(sorted(counts.items()))
+
+
+def _result_counter(result: Mapping[str, Any], field: str) -> int:
+    value = result.get(field)
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    trace = result.get("trace")
+    if isinstance(trace, Mapping):
+        value = trace.get(field)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+    return 0
+
+
+def _report_result(result: Mapping[str, Any]) -> dict[str, Any]:
+    """Allowlist one result row before it reaches a persisted report."""
+
+    safe = {key: result[key] for key in REPORT_RESULT_FIELDS if key in result}
+    trace = result.get("trace")
+    if not isinstance(trace, Mapping):
+        return safe
+    safe_trace = {
+        key: trace[key]
+        for key in (*TRACE_COUNTER_FIELDS, "route_history")
+        if key in trace
+    }
+    steps = trace.get("agent_steps")
+    if isinstance(steps, list):
+        safe_trace["agent_steps"] = [
+            {
+                key: step[key]
+                for key in REPORT_AGENT_STEP_FIELDS
+                if key in step
+            }
+            for step in steps
+            if isinstance(step, Mapping)
+        ]
+    safe["trace"] = safe_trace
+    return safe
+
+
+def build_execution_report(
+    *,
+    base_url: str,
+    dataset: RawDataset,
+    cases: Sequence[AuditCase],
+    conversations: Sequence[AuditConversation],
+    independent_results: Sequence[Mapping[str, Any] | None],
+    conversation_results: Sequence[Sequence[Mapping[str, Any]] | None],
+    phase: str,
+) -> dict[str, Any]:
+    """Build a query-free, interruption-safe audit progress snapshot.
+
+    Only whole N-ary conversations are supplied in ``conversation_results``.
+    This keeps a partial report from claiming that multi-turn context/cache
+    semantics were verified when a process stopped between conversation steps.
+    """
+
+    if len(independent_results) != len(cases):
+        raise AuditFailure("independent_progress_shape_mismatch")
+    if len(conversation_results) != len(conversations):
+        raise AuditFailure("conversation_progress_shape_mismatch")
+
+    completed: list[Mapping[str, Any]] = []
+    for case, result in zip(cases, independent_results, strict=True):
+        if result is None:
+            continue
+        if (
+            result.get("case_id") != case.case_id
+            or result.get("suite") != case.suite
+        ):
+            raise AuditFailure("independent_progress_case_mismatch")
+        completed.append(_report_result(result))
+
+    completed_conversations = 0
+    for conversation, rows in zip(conversations, conversation_results, strict=True):
+        if rows is None:
+            continue
+        expected_ids = [step.case_id for step in conversation.steps]
+        actual_ids = [row.get("case_id") for row in rows]
+        expected_suites = [step.suite for step in conversation.steps]
+        actual_suites = [row.get("suite") for row in rows]
+        if actual_ids != expected_ids or actual_suites != expected_suites:
+            raise AuditFailure("conversation_progress_case_mismatch")
+        completed_conversations += 1
+        completed.extend(_report_result(row) for row in rows)
+
+    planned_cases = [
+        *cases,
+        *(step for conversation in conversations for step in conversation.steps),
+    ]
+    planned_count = len(planned_cases)
+    completed_count = len(completed)
+    is_complete = (
+        completed_count == planned_count
+        and completed_conversations == len(conversations)
+    )
+    passed = sum(result.get("passed") is True for result in completed)
+    failed = completed_count - passed
+
+    planned_suites = Counter(case.suite for case in planned_cases)
+    completed_suites = Counter(str(result.get("suite")) for result in completed)
+    passed_suites = Counter(
+        str(result.get("suite"))
+        for result in completed
+        if result.get("passed") is True
+    )
+    failed_suites = completed_suites - passed_suites
+    suite_results = {
+        suite: {
+            "planned": planned_suites[suite],
+            "completed": completed_suites[suite],
+            "passed": passed_suites[suite],
+            "failed": failed_suites[suite],
+            "remaining": planned_suites[suite] - completed_suites[suite],
+        }
+        for suite in sorted(planned_suites)
+    }
+
+    execution_counts = {
+        field: sum(_result_counter(result, field) for result in completed)
+        for field in TRACE_COUNTER_FIELDS
+    }
+    fact_tool_results: Counter[str] = Counter()
+    for result in completed:
+        values = result.get("tool_result_counts")
+        if not isinstance(values, Mapping):
+            continue
+        for tool in ("persons", "companies", "relations"):
+            count = values.get(tool)
+            if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+                fact_tool_results[tool] += count
+
+    cache_hit_count = sum(result.get("cache_hit") is True for result in completed)
+    cache_miss_count = sum(result.get("cache_hit") is False for result in completed)
+    cache_match_types = Counter(
+        str(result["cache_match_type"])
+        for result in completed
+        if isinstance(result.get("cache_match_type"), str)
+        and result.get("cache_match_type")
+    )
+    covered_relation_rows = sorted(
+        {
+            row
+            for result in completed
+            if result.get("passed") is True
+            for row in result.get("verified_relation_rows", [])
+            if isinstance(row, int) and not isinstance(row, bool) and row > 0
+        }
+    )
+
+    case_suite_counts = Counter(case.suite for case in cases)
+    nary_suite_counts = Counter(
+        step.suite
+        for conversation in conversations
+        for step in conversation.steps
+    )
+    return {
+        "report_version": "full-dataset-audit-v2",
+        "mode": "executed",
+        "completion_status": "complete" if is_complete else "partial",
+        "complete": is_complete,
+        "audit_outcome": (
+            "failed"
+            if is_complete and failed
+            else "passed"
+            if is_complete
+            else "in_progress"
+        ),
+        "phase": phase,
+        "base_url": base_url,
+        "raw_counts": {
+            "persons": len(dataset.persons),
+            "companies": len(dataset.companies),
+            "relations": len(dataset.relations),
+        },
+        "case_count": len(cases),
+        "profile_case_count": sum(case.suite in PROFILE_SUITES for case in cases),
+        "semantic_case_count": sum(case.suite in SEMANTIC_SUITES for case in cases),
+        "nary_conversation_count": len(conversations),
+        "completed_nary_conversations": completed_conversations,
+        "nary_step_count": sum(len(item.steps) for item in conversations),
+        "planned_chat_requests": planned_count,
+        "completed_chat_requests": completed_count,
+        "remaining_chat_requests": planned_count - completed_count,
+        "passed": passed,
+        "failed": failed,
+        "suite_counts": dict(sorted(case_suite_counts.items())),
+        "nary_suite_counts": dict(sorted(nary_suite_counts.items())),
+        "suite_results": suite_results,
+        "agent_counts": {
+            "model_calls": execution_counts["model_calls"],
+            "planner_model_calls": execution_counts["planner_model_calls"],
+            "researcher_model_calls": execution_counts["researcher_model_calls"],
+            "visualizer_model_calls": execution_counts["visualizer_model_calls"],
+            "research_steps": execution_counts["research_steps"],
+            "replans": execution_counts["replans"],
+        },
+        "tool_counts": {
+            "executed_calls": execution_counts["tool_calls"],
+            "successful_receipts_by_tool": {
+                tool: fact_tool_results[tool]
+                for tool in ("persons", "companies", "relations")
+            },
+        },
+        "cache_counts": {
+            "hits": cache_hit_count,
+            "misses": cache_miss_count,
+            "unknown": completed_count - cache_hit_count - cache_miss_count,
+            "match_types": dict(sorted(cache_match_types.items())),
+        },
+        "raw_relation_coverage": {
+            "covered_source_rows": covered_relation_rows,
+            "covered_count": len(covered_relation_rows),
+            "total_source_rows": len(dataset.relations),
+        },
+        # Rows intentionally contain no query text, prompt, credential or model
+        # provider payload.  Failed rows retain only the API's bounded safe trace.
+        "results": list(completed),
+    }
+
+
+def write_report_atomic(path: Path, report: Mapping[str, Any]) -> None:
+    """Durably replace a report using a temporary file in the same directory."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        with temporary.open("x", encoding="utf-8") as handle:
+            handle.write(_safe_json(report) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def plan_summary(
+    cases: Sequence[AuditCase],
+    conversations: Sequence[AuditConversation],
+    dataset: RawDataset,
+) -> dict[str, Any]:
     counts = Counter(case.suite for case in cases)
+    conversation_steps = [
+        step for conversation in conversations for step in conversation.steps
+    ]
+    nary_counts = Counter(conversation.entity_count for conversation in conversations)
+    profile_count = sum(case.suite in PROFILE_SUITES for case in cases)
+    semantic_count = sum(case.suite in SEMANTIC_SUITES for case in cases)
     return {
         "mode": "plan-only",
         "network_requests": 0,
@@ -635,8 +1737,16 @@ def plan_summary(cases: Sequence[AuditCase], dataset: RawDataset) -> dict[str, A
             "relations": len(dataset.relations),
         },
         "case_count": len(cases),
+        "profile_case_count": profile_count,
+        "semantic_case_count": semantic_count,
         "suite_counts": dict(sorted(counts.items())),
         "empty_expected_case_count": sum(case.is_empty for case in cases),
+        "nary_conversation_count": len(conversations),
+        "nary_conversation_counts": {
+            str(size): nary_counts.get(size, 0) for size in (3, 5, 10)
+        },
+        "nary_step_count": len(conversation_steps),
+        "planned_chat_requests": len(cases) + len(conversation_steps),
     }
 
 
@@ -655,6 +1765,41 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-locations", type=_nonnegative_int_argument)
     parser.add_argument("--max-pairs", type=_nonnegative_int_argument)
     parser.add_argument(
+        "--max-intersections",
+        type=_nonnegative_int_argument,
+        default=2,
+    )
+    parser.add_argument(
+        "--max-direct-groups",
+        type=_nonnegative_int_argument,
+        default=3,
+    )
+    parser.add_argument(
+        "--max-multi-goal",
+        type=_nonnegative_int_argument,
+        default=1,
+    )
+    parser.add_argument(
+        "--max-dependent-location",
+        type=_nonnegative_int_argument,
+        default=1,
+    )
+    parser.add_argument(
+        "--max-nary-triples",
+        type=_nonnegative_int_argument,
+        default=20,
+    )
+    parser.add_argument(
+        "--max-nary-fives",
+        type=_nonnegative_int_argument,
+        default=10,
+    )
+    parser.add_argument(
+        "--max-nary-tens",
+        type=_nonnegative_int_argument,
+        default=2,
+    )
+    parser.add_argument(
         "--skip-empty",
         action="store_true",
         help="Skip data-derived cases whose expected raw relation set is empty.",
@@ -669,17 +1814,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.concurrency > 16:
         raise SystemExit("--concurrency must not exceed 16")
     dataset = RawDataset.load(args.data_directory.resolve())
-    cases = dataset.build_cases(
+    base_cases = dataset.build_cases(
         max_persons=args.max_persons,
         max_companies=args.max_companies,
         max_locations=args.max_locations,
         max_pairs=args.max_pairs,
         skip_empty=args.skip_empty,
     )
+    extended_cases = dataset.build_extended_cases(
+        max_person_profiles=args.max_persons,
+        max_company_profiles=args.max_companies,
+        max_intersections=args.max_intersections,
+        max_direct_groups=args.max_direct_groups,
+        max_multi_goal=args.max_multi_goal,
+        max_dependent_location=args.max_dependent_location,
+        skip_empty=args.skip_empty,
+    )
+    cases = (*base_cases, *extended_cases)
+    conversations = dataset.build_nary_conversations(
+        max_triples=args.max_nary_triples,
+        max_fives=args.max_nary_fives,
+        max_tens=args.max_nary_tens,
+    )
     if not args.execute:
-        print(_safe_json(plan_summary(cases, dataset)))
+        print(_safe_json(plan_summary(cases, conversations, dataset)))
         return 0
-    if not cases:
+    if not cases and not conversations:
         raise SystemExit("execution plan is empty")
 
     client = ApiClient(args.base_url, args.timeout)
@@ -688,29 +1848,65 @@ def main(argv: Sequence[str] | None = None) -> int:
         if status not in {"ok", "ready", "healthy"}:
             raise AuditFailure(f"service_not_ready:{path}:{status}")
 
-    results = execute_plan(client=client, cases=cases, concurrency=args.concurrency)
-    failures = [result for result in results if result.get("passed") is not True]
-    report = {
-        "mode": "executed",
-        "base_url": client.base_url,
-        "raw_counts": {
-            "persons": len(dataset.persons),
-            "companies": len(dataset.companies),
-            "relations": len(dataset.relations),
-        },
-        "case_count": len(cases),
-        "passed": len(results) - len(failures),
-        "failed": len(failures),
-        "suite_counts": dict(sorted(Counter(case.suite for case in cases).items())),
-        "results": results,
-    }
-    args.report.parent.mkdir(parents=True, exist_ok=True)
-    args.report.write_text(_safe_json(report) + "\n", encoding="utf-8")
+    independent_progress: list[dict[str, Any] | None] = [None] * len(cases)
+    conversation_progress: list[list[dict[str, Any]] | None] = [
+        None
+    ] * len(conversations)
+
+    def checkpoint(phase: str) -> dict[str, Any]:
+        report = build_execution_report(
+            base_url=client.base_url,
+            dataset=dataset,
+            cases=cases,
+            conversations=conversations,
+            independent_results=independent_progress,
+            conversation_results=conversation_progress,
+            phase=phase,
+        )
+        write_report_atomic(args.report, report)
+        return report
+
+    # Write a valid zero-progress snapshot before the first paid request.  Each
+    # independent case then advances it from the coordinator thread; no worker
+    # writes the file, so concurrency greater than one cannot interleave JSON.
+    checkpoint("ready")
+
+    def record_case(index: int, result: dict[str, Any]) -> None:
+        independent_progress[index] = result
+        checkpoint("independent_cases")
+
+    execute_plan(
+        client=client,
+        cases=cases,
+        concurrency=args.concurrency,
+        on_case_complete=record_case,
+    )
+    checkpoint("independent_complete")
+
+    def record_conversation(index: int, rows: list[dict[str, Any]]) -> None:
+        conversation_progress[index] = rows
+        checkpoint("nary_conversations")
+
+    execute_conversations(
+        client=client,
+        conversations=conversations,
+        concurrency=args.concurrency,
+        on_conversation_complete=record_conversation,
+    )
+    report = checkpoint("complete")
+    failures = [
+        result
+        for result in report["results"]
+        if isinstance(result, Mapping) and result.get("passed") is not True
+    ]
     print(
         _safe_json(
             {
                 "mode": "executed",
                 "case_count": len(cases),
+                "nary_conversation_count": len(conversations),
+                "planned_chat_requests": report["planned_chat_requests"],
+                "completed_chat_requests": report["completed_chat_requests"],
                 "passed": report["passed"],
                 "failed": report["failed"],
                 "report": str(args.report.resolve()),
@@ -718,6 +1914,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     )
     return 1 if failures else 0
+
+
+def _nary_union_message(labels: Sequence[str], variant: int) -> str:
+    if not labels:
+        raise AuditFailure("nary_query_requires_entities")
+    return NARY_UNION_TEMPLATES[variant % len(NARY_UNION_TEMPLATES)].format(
+        entities="、".join(labels)
+    )
+
+
+def _location_followup_message(variant: int) -> str:
+    return LOCATION_FOLLOWUP_TEMPLATES[
+        variant % len(LOCATION_FOLLOWUP_TEMPLATES)
+    ]
 
 
 def _load_array(path: Path) -> list[dict[str, Any]]:
@@ -787,6 +1997,14 @@ def _string_list(value: Any) -> list[str]:
     return value
 
 
+def _optional_string_list(value: Any) -> list[str]:
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item for item in value
+    ):
+        raise AuditFailure("invalid_optional_string_list")
+    return value
+
+
 def _nonnegative_int(value: Any, field: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise AuditFailure(f"invalid_trace_counter:{field}")
@@ -816,6 +2034,12 @@ def _positive_float(value: str) -> float:
 
 def _joined(values: Iterable[str]) -> str:
     return ",".join(sorted(values)) or "none"
+
+
+def _counter_text(values: Counter[str]) -> str:
+    return ",".join(
+        f"{key}:{values[key]}" for key in sorted(values)
+    ) or "none"
 
 
 def _redact(value: str, environment: Mapping[str, str] | None = None) -> str:

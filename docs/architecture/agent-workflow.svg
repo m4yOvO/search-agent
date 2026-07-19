@@ -1,0 +1,153 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="900" viewBox="0 0 1440 900" role="img" aria-labelledby="title desc">
+  <title id="title">企业关系探索系统的 LangGraph 多智能体协作架构</title>
+  <desc id="desc">用户请求进入 FastAPI 和 StateGraph。缓存未命中时，Planner 分析并生成任务，Researcher 调用三个事实工具，Visualizer 生成回答和图谱。所有角色通过共享状态通信。</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/>
+    </marker>
+    <marker id="arrow-accent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#0f766e"/>
+    </marker>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="5" flood-color="#0f172a" flood-opacity="0.12"/>
+    </filter>
+    <style>
+      .canvas { fill: #f8fafc; }
+      .title { font: 700 30px Inter, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #0f172a; }
+      .subtitle { font: 400 15px Inter, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #475569; }
+      .group-label { font: 700 17px Inter, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #334155; }
+      .node-title { font: 700 16px Inter, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #0f172a; text-anchor: middle; }
+      .node-detail { font: 400 13px Inter, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #475569; text-anchor: middle; }
+      .small { font: 600 12px Inter, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #334155; text-anchor: middle; }
+      .edge-label { font: 600 12px Inter, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #475569; paint-order: stroke; stroke: #f8fafc; stroke-width: 5px; stroke-linejoin: round; }
+      .edge { fill: none; stroke: #475569; stroke-width: 2; marker-end: url(#arrow); }
+      .edge-accent { fill: none; stroke: #0f766e; stroke-width: 2.5; marker-end: url(#arrow-accent); }
+      .edge-dashed { fill: none; stroke: #64748b; stroke-width: 1.7; stroke-dasharray: 7 6; }
+      .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; rx: 18; filter: url(#shadow); }
+      .planner { fill: #f3e8ff; stroke: #9333ea; stroke-width: 2; rx: 14; }
+      .researcher { fill: #dbeafe; stroke: #2563eb; stroke-width: 2; rx: 14; }
+      .visualizer { fill: #dcfce7; stroke: #16a34a; stroke-width: 2; rx: 14; }
+      .runtime { fill: #ecfeff; stroke: #0891b2; stroke-width: 2; rx: 14; }
+      .memory { fill: #ffedd5; stroke: #ea580c; stroke-width: 2; rx: 14; }
+      .tool { fill: #f1f5f9; stroke: #64748b; stroke-width: 1.5; rx: 10; }
+      .state { fill: #fff7ed; stroke: #f97316; stroke-width: 1.8; stroke-dasharray: 8 5; rx: 12; }
+    </style>
+  </defs>
+
+  <rect class="canvas" x="0" y="0" width="1440" height="900" rx="24"/>
+  <text class="title" x="56" y="48">LangGraph 多智能体协作架构</text>
+  <text class="subtitle" x="56" y="75">FastAPI 每个请求只调用一次 StateGraph；Agent 通过共享 State 交换结构化结果</text>
+
+  <rect class="runtime" x="48" y="106" width="190" height="78"/>
+  <text class="node-title" x="143" y="137">公众用户</text>
+  <text class="node-detail" x="143" y="160">React 聊天 + 图谱</text>
+
+  <rect class="runtime" x="292" y="106" width="190" height="78"/>
+  <text class="node-title" x="387" y="137">FastAPI</text>
+  <text class="node-detail" x="387" y="160">POST /chat</text>
+
+  <rect class="runtime" x="536" y="106" width="210" height="78"/>
+  <text class="node-title" x="641" y="137">StateGraph</text>
+  <text class="node-detail" x="641" y="160">条件边 + 有界循环</text>
+
+  <rect class="memory" x="800" y="96" width="238" height="98"/>
+  <text class="node-title" x="919" y="130">raw_cache_probe</text>
+  <text class="node-detail" x="919" y="154">Planner 前检查相同 query</text>
+  <text class="node-detail" x="919" y="174">hit / miss</text>
+
+  <rect class="memory" x="1092" y="106" width="240" height="78"/>
+  <text class="node-title" x="1212" y="137">Chroma 长期记忆</text>
+  <text class="node-detail" x="1212" y="160">WARM → HOT</text>
+
+  <path class="edge" d="M 238 145 H 292"/>
+  <path class="edge" d="M 482 145 H 536"/>
+  <path class="edge" d="M 746 145 H 800"/>
+  <path class="edge-accent" d="M 1038 145 H 1092"/>
+  <text class="edge-label" x="1053" y="132">hit</text>
+
+  <rect class="state" x="428" y="232" width="574" height="58"/>
+  <text class="node-title" x="715" y="257">共享 LangGraph State</text>
+  <text class="node-detail" x="715" y="278">计划 · 工具回执 · Evidence · 当前输出 · 安全 trace</text>
+
+  <rect class="panel" x="48" y="318" width="350" height="270"/>
+  <text class="group-label" x="74" y="350">Planner（同一角色的两个节点）</text>
+  <rect class="planner" x="82" y="376" width="282" height="76"/>
+  <text class="node-title" x="223" y="406">planner_analyze</text>
+  <text class="node-detail" x="223" y="430">意图、全部实体、上下文、研究目标</text>
+  <rect class="planner" x="82" y="482" width="282" height="76"/>
+  <text class="node-title" x="223" y="512">planner_tasks</text>
+  <text class="node-detail" x="223" y="536">批量实体任务 + 关系任务 DAG</text>
+  <path class="edge" d="M 223 452 V 482"/>
+
+  <rect class="panel" x="448" y="318" width="310" height="270"/>
+  <text class="group-label" x="474" y="350">Researcher</text>
+  <rect class="researcher" x="482" y="376" width="242" height="86"/>
+  <text class="node-title" x="603" y="406">native tool calling</text>
+  <text class="node-detail" x="603" y="430">每轮一个工具或生命周期动作</text>
+  <rect class="researcher" x="482" y="492" width="242" height="66"/>
+  <text class="node-title" x="603" y="519">result_gate</text>
+  <text class="node-detail" x="603" y="541">next / replan / finish</text>
+  <path class="edge" d="M 603 462 V 492"/>
+  <path class="edge" d="M 724 525 C 770 525 770 419 724 419"/>
+  <text class="edge-label" x="746" y="475">next</text>
+
+  <rect class="panel" x="808" y="318" width="524" height="270"/>
+  <text class="group-label" x="834" y="350">事实工具层</text>
+  <rect class="tool" x="842" y="376" width="196" height="66"/>
+  <text class="node-title" x="940" y="404">ToolSpec Registry</text>
+  <text class="node-detail" x="940" y="426">Schema + handler + adapter</text>
+  <rect class="tool" x="1080" y="376" width="104" height="58"/>
+  <text class="small" x="1132" y="410">persons</text>
+  <rect class="tool" x="1198" y="376" width="104" height="58"/>
+  <text class="small" x="1250" y="410">companies</text>
+  <rect class="tool" x="1080" y="456" width="222" height="58"/>
+  <text class="small" x="1191" y="490">relations</text>
+  <rect class="tool" x="842" y="472" width="196" height="72"/>
+  <text class="node-title" x="940" y="501">原始 mock 数据</text>
+  <text class="node-detail" x="940" y="524">20 人 · 30 企业 · 109 关系</text>
+  <path class="edge" d="M 1038 409 H 1080"/>
+  <path class="edge" d="M 1184 409 H 1198"/>
+  <path class="edge" d="M 1038 424 C 1060 424 1052 485 1080 485"/>
+  <path class="edge-accent" d="M 1080 508 H 1038"/>
+
+  <path class="edge-accent" d="M 919 194 V 214 H 223 V 376"/>
+  <text class="edge-label" x="930" y="214">miss</text>
+  <path class="edge" d="M 364 520 H 482"/>
+  <path class="edge" d="M 724 419 H 842"/>
+  <path class="edge-accent" d="M 842 508 C 790 508 790 445 724 445"/>
+  <path class="edge" d="M 482 525 C 426 525 426 414 364 414"/>
+  <text class="edge-label" x="401" y="481">replan</text>
+
+  <path class="edge-dashed" d="M 223 318 V 290"/>
+  <path class="edge-dashed" d="M 603 318 V 290"/>
+
+  <rect class="visualizer" x="448" y="676" width="310" height="92"/>
+  <text class="node-title" x="603" y="708">Visualizer</text>
+  <text class="node-detail" x="603" y="733">仅选择已验证记录</text>
+  <text class="node-detail" x="603" y="753">生成 answer + nodes + edges</text>
+
+  <rect class="memory" x="808" y="676" width="238" height="92"/>
+  <text class="node-title" x="927" y="708">canonical_cache_probe</text>
+  <text class="node-detail" x="927" y="733">证据化签名复用</text>
+  <text class="node-detail" x="927" y="753">miss → Visualizer</text>
+
+  <rect class="runtime" x="1092" y="676" width="240" height="92"/>
+  <text class="node-title" x="1212" y="708">HTTP 响应</text>
+  <text class="node-detail" x="1212" y="733">answer + graph + memory</text>
+  <text class="node-detail" x="1212" y="753">+ trace</text>
+
+  <path class="edge" d="M 603 558 V 676"/>
+  <text class="edge-label" x="614" y="625">完整零结果</text>
+  <path class="edge" d="M 724 525 C 790 525 760 722 808 722"/>
+  <text class="edge-label" x="767" y="636">finish</text>
+  <path class="edge" d="M 808 745 H 758"/>
+  <path class="edge-accent" d="M 758 722 H 1092"/>
+  <path class="edge-accent" d="M 1046 706 C 1080 650 1054 206 1212 184"/>
+  <text class="edge-label" x="1072" y="627">cache hit</text>
+  <path class="edge-accent" d="M 1332 145 C 1380 145 1382 722 1332 722"/>
+  <path class="edge-accent" d="M 1092 722 H 1050"/>
+  <path class="edge-accent" d="M 1092 746 C 866 842 278 842 143 184"/>
+  <text class="edge-label" x="698" y="842">answer + graph</text>
+
+  <text class="subtitle" x="56" y="875">实线表示执行与数据流；虚线表示 Agent 读写同一个请求级共享 State。</text>
+</svg>

@@ -18,7 +18,6 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    app_env: str = "development"
     agent_mode: str = "openai"
     log_level: str = "INFO"
     # Local development reads the three raw JSON files directly from data/.
@@ -28,7 +27,7 @@ class Settings(BaseSettings):
 
     chroma_host: str = "127.0.0.1"
     chroma_port: int = 8001
-    chroma_collection_prefix: str = "enterprise_query_cache_v18"
+    chroma_collection_prefix: str = "enterprise_query_cache_v23"
     chroma_connect_retries: int = 12
     chroma_retry_delay_seconds: float = 1.0
 
@@ -41,10 +40,9 @@ class Settings(BaseSettings):
 
     cache_ttl_hours: int = 24
     graph_schema_version: int = 1
-    # v3 adds association operators to requested/effective relation semantics,
-    # raw qualifiers, verified
-    # empty scopes, control policy, and entity-match algorithm provenance.
-    query_signature_version: int = 4
+    # v5 signs each N-ary/multi-goal objective, its aggregation, dependencies,
+    # verified result status and complete follow-up focus independently.
+    query_signature_version: int = 5
     permission_scope: str = "public-demo"
 
     # ``max_research_steps`` is the normal Researcher model/tool-decision budget.
@@ -56,6 +54,7 @@ class Settings(BaseSettings):
     research_retry_step_allowance: int = Field(default=3, ge=1, le=8)
     agent_max_iterations: int = Field(default=20, ge=2, le=48)
     graph_recursion_limit: int = Field(default=64, ge=16, le=128)
+    planner_input_token_budget: int = Field(default=12_000, ge=4_000, le=64_000)
     tool_timeout_seconds: float = 5.0
     chat_timeout_seconds: float = Field(default=570.0, gt=0, le=590)
 

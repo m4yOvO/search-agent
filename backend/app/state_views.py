@@ -73,6 +73,35 @@ def cached_payload(state: Mapping[str, Any]) -> CachedPayload | None:
     return parsed if isinstance(parsed, CachedPayload) else None
 
 
+def signature_context_entity_ids(signature: QuerySignature) -> list[str]:
+    """Return every trusted context ID carried by the canonical v5 signature."""
+
+    return sorted(
+        {
+            *signature.context_entity_ids,
+            *(
+                entity_id
+                for goal in signature.goals
+                for entity_id in goal.context_entity_ids
+            ),
+        }
+    )
+
+
+def signature_focus_entity_ids(signature: QuerySignature) -> list[str]:
+    """Project complete per-goal focus without reinterpreting query semantics."""
+
+    if not signature.goals:
+        return []
+    return sorted(
+        {
+            entity_id
+            for goal in signature.goals
+            for entity_id in goal.focus_entity_ids
+        }
+    )
+
+
 def request_semantics(state: Mapping[str, Any]) -> RequestSemantics:
     """Derive request semantics without consulting duplicated state channels.
 
@@ -106,7 +135,7 @@ def request_semantics(state: Mapping[str, Any]) -> RequestSemantics:
     elif signature is not None:
         cache_scope = (
             CacheScope.CONVERSATION
-            if signature.context_entity_ids
+            if signature_context_entity_ids(signature)
             else CacheScope.CONTEXT_FREE
         )
     elif plan is not None:

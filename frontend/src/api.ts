@@ -1,4 +1,4 @@
-import type { ChatResponse, GraphPayload } from "./types";
+import type { ChatResponse } from "./types";
 
 // A prompt-driven turn can require several sequential model/tool decisions. Nginx
 // allows 600s for /chat; keep the browser slightly beyond that boundary so it does
@@ -88,9 +88,4 @@ export function sendChat(
       locale: "zh-CN"
     })
   });
-}
-
-export function getGraph(conversationId: string): Promise<GraphPayload> {
-  const query = new URLSearchParams({ conversation_id: conversationId });
-  return request<GraphPayload>(`/graph?${query.toString()}`);
 }

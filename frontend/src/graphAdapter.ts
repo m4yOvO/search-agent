@@ -142,5 +142,3 @@ export function fitOptionsForMotion(
     ? { animation: false }
     : { animation: { duration, easingFunction: "easeInOutQuad" } };
 }
-
-export const NETWORK_OPTIONS: Options = networkOptionsForMotion(false);

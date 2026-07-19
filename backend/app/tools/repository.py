@@ -222,9 +222,9 @@ def _fuzzy_score(query: str, label: str) -> tuple[float, str] | None:
     )
     query_phonetic = _soundex(query_value.replace(" ", ""))
     label_phonetic = _soundex(matched_text.replace(" ", ""))
-    # A phonetic match is supporting evidence, never a perfect match.  0.84 was
-    # chosen so Mask/Musk clears the 0.75 threshold and remains >0.08 above
-    # Mask/Mark, whose Soundex codes differ.
+    # A phonetic match is supporting evidence, never a perfect match.  Keep its
+    # weight above the declared acceptance floor while leaving room for lexical
+    # evidence and the mandatory lead-margin ambiguity check.
     phonetic = 0.84 if query_phonetic and query_phonetic == label_phonetic else 0.0
     return max(lexical, phonetic), matched_text
 
@@ -911,7 +911,10 @@ class FixtureRepository:
                 len(selected_nodes) < len(ordered_nodes),
             )
 
-        if match_mode is MatchMode.EXACT:
+        if match_mode in {
+            MatchMode.EXACT,
+            MatchMode.CROSS_LANGUAGE_EXACT,
+        }:
             return EntitySearchPage((), (), 0, False)
 
         fuzzy_proofs = sorted(

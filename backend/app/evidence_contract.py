@@ -5,7 +5,15 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-from app.schemas import Intent, NodeType, QuerySignature, RelationType, ResultMergeStrategy
+from app.schemas import (
+    GoalResultStatus,
+    Intent,
+    NodeType,
+    QueryGoalSignature,
+    QuerySignature,
+    RelationType,
+    ResultMergeStrategy,
+)
 
 
 RELATIONAL_INTENTS = frozenset(
@@ -20,6 +28,11 @@ RELATIONAL_INTENTS = frozenset(
 def requires_explicit_relations(signature: QuerySignature) -> bool:
     """Return whether a successful result must contain explicit relation records."""
 
+    if signature.goals:
+        return any(
+            goal.intent in RELATIONAL_INTENTS or bool(goal.relation_types)
+            for goal in signature.goals
+        )
     return signature.intent in RELATIONAL_INTENTS or bool(signature.relation_types)
 
 
@@ -38,6 +51,9 @@ def validate_signature_records(
 
     selected = list(selected_records)
     catalog = list(all_records)
+    if signature.goals:
+        _validate_goal_signature_records(signature, selected, catalog)
+        return
     entities = {
         str(record["id"]): record
         for record in catalog
@@ -121,10 +137,15 @@ def validate_signature_records(
     missing_subjects = set(signature.subject_ids) - endpoints
     if (
         missing_subjects
-        and signature.result_merge is not ResultMergeStrategy.UNION
+        and signature.result_merge
+        not in {ResultMergeStrategy.UNION, ResultMergeStrategy.DIRECT}
+        and signature.intent is not Intent.LOCATE_ENTITIES
     ):
         raise ValueError("signature subjects are not endpoints of selected relations")
-    if set(signature.object_ids) - endpoints:
+    if (
+        set(signature.object_ids) - endpoints
+        and signature.result_merge is not ResultMergeStrategy.DIRECT
+    ):
         raise ValueError("signature objects are not endpoints of selected relations")
     if signature.subject_ids and signature.object_ids:
         subjects = set(signature.subject_ids)
@@ -199,6 +220,27 @@ def expected_focus_entity_ids(
         if record.get("record_kind") == "entity" and record.get("id")
     }
 
+    if signature.goals:
+        expected = {
+            entity_id
+            for goal in signature.goals
+            for entity_id in goal.focus_entity_ids
+        }
+        eligible = selected_entities | {
+            str(endpoint)
+            for record in relations
+            for endpoint in (record.get("source"), record.get("target"))
+            if endpoint is not None
+        }
+        if not expected and all(
+            goal.result_status is GoalResultStatus.SKIPPED_EMPTY_INPUT
+            for goal in signature.goals
+        ):
+            return []
+        if not expected or expected - entities.keys() or expected - eligible:
+            raise ValueError("verified goal records do not provide a complete focus set")
+        return sorted(expected)
+
     if signature.intent is Intent.LOCATE_ENTITIES:
         expected = set(signature.subject_ids)
     elif relations:
@@ -209,9 +251,31 @@ def expected_focus_entity_ids(
             if endpoint is not None
         }
         target_types = {item.value for item in signature.target_types}
-        if signature.result_merge is ResultMergeStrategy.UNION:
+        if signature.result_merge is ResultMergeStrategy.DIRECT:
+            # A direct query returns the induced subgraph over its operands.  All
+            # operands remain the natural referent set even when one has no edge.
+            expected = {*signature.subject_ids, *signature.object_ids}
+        elif signature.object_ids:
+            # Researcher derives signed result objects from the verified relation
+            # projection.  Prefer that role-aware set over reconstructing neighbours
+            # by subtracting subjects from endpoints: for a retained self relation,
+            # the same entity is both the subject and its legitimate result object.
             expected = set(signature.object_ids)
+            if expected - entities.keys() or expected - endpoints:
+                raise ValueError(
+                    "verified records do not provide a complete focus set"
+                )
+            if target_types and any(
+                str(entities.get(entity_id, {}).get("entity_type", ""))
+                not in target_types
+                for entity_id in expected
+            ):
+                raise ValueError(
+                    "signed focus objects fall outside the requested target types"
+                )
         elif target_types:
+            # Compatibility path for signatures created before result objects were
+            # signed explicitly.  Current v5 goal signatures take the branch above.
             expected = {
                 entity_id
                 for entity_id in endpoints
@@ -238,3 +302,103 @@ def expected_focus_entity_ids(
     if not expected or expected - entities.keys() or expected - eligible:
         raise ValueError("verified records do not provide a complete focus set")
     return sorted(expected)
+
+
+def _validate_goal_signature_records(
+    signature: QuerySignature,
+    selected: list[Mapping[str, Any]],
+    catalog: list[Mapping[str, Any]],
+) -> None:
+    """Validate each goal against only its runtime-derived result record set."""
+
+    selected_by_id = {
+        str(record["id"]): record
+        for record in selected
+        if record.get("id") is not None
+    }
+    catalog_entities = {
+        str(record["id"])
+        for record in catalog
+        if record.get("record_kind") == "entity" and record.get("id")
+    }
+    goal_by_id = {goal.goal_id: goal for goal in signature.goals}
+    assigned_relation_ids: set[str] = set()
+    for goal in signature.goals:
+        missing_subjects = set(goal.subject_ids) - catalog_entities
+        if missing_subjects:
+            raise ValueError("goal signature subjects are not verified entities")
+        if set(goal.context_entity_ids) - set(signature.context_entity_ids):
+            raise ValueError("goal context IDs are absent from the query signature")
+        if goal.result_status is GoalResultStatus.SKIPPED_EMPTY_INPUT:
+            if not goal.depends_on_goal_ids:
+                raise ValueError("an empty-input goal requires a verified dependency")
+            if not any(
+                goal_by_id[dependency].result_status
+                is not GoalResultStatus.NONEMPTY
+                for dependency in goal.depends_on_goal_ids
+            ):
+                raise ValueError("an empty-input goal requires an empty dependency")
+            continue
+        if goal.result_status is GoalResultStatus.VERIFIED_EMPTY:
+            continue
+
+        goal_records: list[Mapping[str, Any]] = []
+        for record_id in goal.result_record_ids:
+            record = selected_by_id.get(record_id)
+            if record is None:
+                raise ValueError("goal result record is absent from selected records")
+            goal_records.append(record)
+            if record.get("record_kind") == "relation":
+                assigned_relation_ids.add(record_id)
+        required_entity_proofs: set[str] = set()
+        if goal.aggregation is ResultMergeStrategy.DIRECT:
+            # A non-empty induced subgraph may contain verified operands with no
+            # incident edge.  Those entities are still part of the direct result's
+            # natural focus.
+            required_entity_proofs.update(goal.subject_ids)
+            required_entity_proofs.update(goal.object_ids)
+        if goal.intent is Intent.LOCATE_ENTITIES:
+            # A complete batch location query retains every queried company as
+            # focus, including a company with no headquarters edge.
+            required_entity_proofs.update(goal.subject_ids)
+        if required_entity_proofs - set(goal.result_record_ids):
+            raise ValueError(
+                "goal result records must include every focus entity without edge proof"
+            )
+        legacy = _goal_as_query_signature(signature, goal)
+        validate_signature_records(legacy, goal_records, catalog)
+
+    selected_relation_ids = {
+        str(record["id"])
+        for record in selected
+        if record.get("record_kind") == "relation" and record.get("id")
+    }
+    if selected_relation_ids != assigned_relation_ids:
+        raise ValueError("selected relation records are not assigned to query goals")
+
+
+def _goal_as_query_signature(
+    parent: QuerySignature, goal: QueryGoalSignature
+) -> QuerySignature:
+    """Project one signed goal through the existing single-goal evidence checks."""
+
+    return QuerySignature(
+        version=parent.version,
+        intent=goal.intent,
+        subject_ids=goal.subject_ids,
+        object_ids=goal.object_ids,
+        relation_types=goal.effective_relation_types,
+        requested_relation_types=goal.requested_relation_types,
+        effective_relation_types=goal.effective_relation_types,
+        raw_relation_qualifiers=goal.raw_relation_qualifiers,
+        verified_empty_relation_types=goal.verified_empty_relation_types,
+        target_types=goal.target_types,
+        requested_attributes=goal.requested_attributes,
+        context_entity_ids=goal.context_entity_ids,
+        result_merge=goal.aggregation,
+        control_policy=goal.control_policy,
+        control_policy_version=parent.control_policy_version,
+        entity_match_version=parent.entity_match_version,
+        locale=parent.locale,
+        goals=[],
+    )

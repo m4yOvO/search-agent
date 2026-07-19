@@ -10,7 +10,10 @@ from pydantic import ValidationError
 
 from app.agents.prompts import VISUALIZER_SYSTEM_PROMPT
 from app.agents.state import AgentState
-from app.state_views import request_semantics
+from app.state_views import (
+    request_semantics,
+    signature_focus_entity_ids,
+)
 from app.evidence_contract import (
     expected_focus_entity_ids,
     requires_explicit_relations,
@@ -21,10 +24,12 @@ from app.memory.graph_ops import empty_graph, make_graph
 from app.schemas import (
     ControlQueryPolicy,
     Evidence,
+    GoalResultStatus,
     GraphEdge,
     GraphNode,
     Intent,
     NodeType,
+    QueryGoalSignature,
     QuerySignature,
     RelationType,
     VisualizerDecision,
@@ -32,10 +37,6 @@ from app.schemas import (
 )
 
 
-ZH_DISCLAIMER = "结果来自本地演示数据，不代表实时工商或法律结论。"
-EN_DISCLAIMER = (
-    "Results use local demo data and are not current legal or corporate conclusions."
-)
 ZH_BROAD_CONTROL_DISCLOSURE = (
     "原始数据没有显式控制记录，以下为创办、现任管理或明确持有关系，"
     "不等同法律控制。"
@@ -48,6 +49,41 @@ EN_BROAD_CONTROL_DISCLOSURE = (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _goal_query_signature(
+    parent: QuerySignature,
+    goal: QueryGoalSignature,
+) -> QuerySignature:
+    """Project one signed goal onto the established evidence validator boundary."""
+
+    return QuerySignature(
+        version=parent.version,
+        intent=goal.intent,
+        subject_ids=goal.subject_ids,
+        object_ids=goal.object_ids,
+        relation_types=goal.relation_types,
+        requested_relation_types=goal.requested_relation_types,
+        effective_relation_types=goal.effective_relation_types,
+        raw_relation_qualifiers=goal.raw_relation_qualifiers,
+        verified_empty_relation_types=goal.verified_empty_relation_types,
+        target_types=goal.target_types,
+        requested_attributes=goal.requested_attributes,
+        context_entity_ids=goal.context_entity_ids,
+        result_merge=goal.aggregation,
+        control_policy=goal.control_policy,
+        control_policy_version=parent.control_policy_version,
+        entity_match_version=parent.entity_match_version,
+        locale=parent.locale,
+    )
+
+
+def _goal_requires_relations(goal: QueryGoalSignature) -> bool:
+    return goal.intent in {
+        Intent.FIND_CONTROLLED_COMPANIES,
+        Intent.FIND_RELATED_COMPANIES,
+        Intent.LOCATE_ENTITIES,
+    } or bool(goal.relation_types)
 
 
 @dataclass(slots=True)
@@ -160,7 +196,7 @@ class Visualizer:
         )
         return {
             **call_updates,
-            "answer": self._with_required_disclosures(
+            "answer": self._with_control_disclosure(
                 decision.answer, state, state.get("locale", "zh-CN")
             ),
             "query_result_graph": graph,
@@ -223,25 +259,53 @@ class Visualizer:
 
         if not is_clarification and is_no_match:
             signature = QuerySignature.model_validate(state.get("query_signature"))
-            if not requires_explicit_relations(signature):
+            self._require_multi_goal_signatures(signature)
+            if not self._signature_requires_relations(signature):
                 raise ValueError("no_match requires a relational query signature")
             if decision.answer_record_ids:
                 raise ValueError("no_match cannot attach entity evidence to an absence claim")
             if required & relation_records.keys():
                 raise ValueError("no_match cannot contain relation records")
-            signed_ids = {*signature.subject_ids, *signature.object_ids}
+            if signature.goals and any(
+                goal.result_status is GoalResultStatus.NONEMPTY
+                for goal in signature.goals
+            ):
+                raise ValueError("no_match cannot contain a non-empty goal")
+            for goal in signature.goals:
+                signed_goal_ids = {*goal.subject_ids, *goal.object_ids}
+                if goal.result_status is GoalResultStatus.SKIPPED_EMPTY_INPUT:
+                    if goal.focus_entity_ids:
+                        raise ValueError("a skipped goal cannot retain result focus")
+                elif set(goal.focus_entity_ids) != signed_goal_ids:
+                    raise ValueError("an empty goal must retain all signed entity focus")
+            signed_ids = self._signed_entity_ids(signature)
             if required != signed_ids:
                 raise ValueError("no_match nodes must exactly match signed entities")
         elif not is_clarification:
             signature = QuerySignature.model_validate(state.get("query_signature"))
+            self._require_multi_goal_signatures(signature)
             selected_records = [
                 entity_records[record_id]
                 if record_id in entity_records
                 else relation_records[record_id]
                 for record_id in required
             ]
-            validate_signature_records(signature, selected_records, records)
-            if requires_explicit_relations(signature):
+            if signature.goals:
+                self._validate_goal_records(
+                    signature,
+                    required,
+                    selected_records,
+                    records,
+                )
+                self._validate_goal_answer_support(
+                    signature,
+                    set(decision.answer_record_ids),
+                    entity_records,
+                    relation_records,
+                )
+            else:
+                validate_signature_records(signature, selected_records, records)
+            if not signature.goals and requires_explicit_relations(signature):
                 supported_edges = (
                     set(decision.answer_record_ids) & relation_records.keys()
                 )
@@ -272,6 +336,116 @@ class Visualizer:
         return make_graph(nodes, edges, self.data_version, graph_evidence)
 
     @staticmethod
+    def _signature_requires_relations(signature: QuerySignature) -> bool:
+        if signature.goals:
+            return any(_goal_requires_relations(goal) for goal in signature.goals)
+        return requires_explicit_relations(signature)
+
+    @staticmethod
+    def _require_multi_goal_signatures(signature: QuerySignature) -> None:
+        if signature.intent is Intent.MULTI_GOAL and not signature.goals:
+            raise ValueError("multi_goal requires signed per-goal results")
+
+    @staticmethod
+    def _signed_entity_ids(signature: QuerySignature) -> set[str]:
+        if signature.goals:
+            return {
+                entity_id
+                for goal in signature.goals
+                for entity_id in (*goal.subject_ids, *goal.object_ids)
+            }
+        return {*signature.subject_ids, *signature.object_ids}
+
+    @staticmethod
+    def _validate_goal_records(
+        signature: QuerySignature,
+        required_ids: set[str],
+        selected_records: list[dict[str, Any]],
+        all_records: list[dict[str, Any]],
+    ) -> None:
+        records_by_id = {
+            str(record["id"]): record
+            for record in all_records
+            if record.get("id") is not None
+        }
+        known_ids = set(records_by_id)
+        claimed_ids = {
+            record_id
+            for goal in signature.goals
+            for record_id in goal.result_record_ids
+        }
+        if claimed_ids - required_ids or claimed_ids - known_ids:
+            raise ValueError("goal result records must come from the Researcher selection")
+
+        permitted_ids = {
+            *claimed_ids,
+            *Visualizer._signed_entity_ids(signature),
+        }
+        for record_id in claimed_ids:
+            record = records_by_id[record_id]
+            if record.get("record_kind") == "relation":
+                permitted_ids.update(
+                    str(endpoint)
+                    for endpoint in (record.get("source"), record.get("target"))
+                    if endpoint is not None
+                )
+        if required_ids - permitted_ids:
+            raise ValueError("Researcher selection contains records outside signed goals")
+
+        selected_ids = {
+            str(record["id"])
+            for record in selected_records
+            if record.get("id") is not None
+        }
+        for goal in signature.goals:
+            signed_ids = {*goal.subject_ids, *goal.object_ids}
+            if goal.result_status is GoalResultStatus.SKIPPED_EMPTY_INPUT:
+                if goal.focus_entity_ids:
+                    raise ValueError("a skipped goal cannot retain result focus")
+                continue
+            if goal.result_status is GoalResultStatus.VERIFIED_EMPTY:
+                if set(goal.focus_entity_ids) != signed_ids:
+                    raise ValueError("an empty goal must retain all signed entity focus")
+                continue
+
+            goal_ids = set(goal.result_record_ids)
+            if not goal_ids or goal_ids - selected_ids:
+                raise ValueError("a non-empty goal requires its complete selected records")
+            goal_records = [records_by_id[record_id] for record_id in goal_ids]
+            goal_signature = _goal_query_signature(signature, goal)
+            validate_signature_records(goal_signature, goal_records, all_records)
+            expected_focus = expected_focus_entity_ids(
+                goal_signature,
+                goal_records,
+                all_records,
+            )
+            if set(goal.focus_entity_ids) != set(expected_focus):
+                raise ValueError("goal focus does not match its verified records")
+
+    @staticmethod
+    def _validate_goal_answer_support(
+        signature: QuerySignature,
+        answer_record_ids: set[str],
+        entity_records: dict[str, dict[str, Any]],
+        relation_records: dict[str, dict[str, Any]],
+    ) -> None:
+        for goal in signature.goals:
+            if goal.result_status is not GoalResultStatus.NONEMPTY:
+                continue
+            answer_kind_ids = (
+                relation_records.keys()
+                if _goal_requires_relations(goal)
+                else entity_records.keys()
+            )
+            supported = (
+                answer_record_ids
+                & set(goal.result_record_ids)
+                & set(answer_kind_ids)
+            )
+            if not supported:
+                raise ValueError("every non-empty goal requires answer support")
+
+    @staticmethod
     def _normalized_focus(
         state: AgentState,
         records: list[dict[str, Any]],
@@ -279,16 +453,23 @@ class Visualizer:
     ) -> list[str]:
         if request_semantics(state).needs_clarification:
             return list(state.get("focus_entity_ids", []))
+        signature = QuerySignature.model_validate(state.get("query_signature"))
+        goal_focus = signature_focus_entity_ids(signature)
         if state.get("no_match"):
-            signature = QuerySignature.model_validate(state.get("query_signature"))
-            expected = sorted({*signature.subject_ids, *signature.object_ids})
+            expected = goal_focus or sorted(
+                {*signature.subject_ids, *signature.object_ids}
+            )
             graph_node_ids = {node.id for node in graph.nodes}
             if not expected or set(expected) - graph_node_ids:
                 raise ValueError(
                     "a verified empty result must retain its signed entity focus"
                 )
             return expected
-        signature = QuerySignature.model_validate(state.get("query_signature"))
+        if goal_focus:
+            graph_node_ids = {node.id for node in graph.nodes}
+            if set(goal_focus) - graph_node_ids:
+                raise ValueError("signed goal focus entities must be selected graph nodes")
+            return goal_focus
         required_ids = set(state.get("selected_record_ids", []))
         selected_records = [
             record for record in records if str(record.get("id")) in required_ids
@@ -374,16 +555,47 @@ class Visualizer:
         allowed_answer_record_ids: list[str] = []
         if not text_only:
             signature = QuerySignature.model_validate(state.get("query_signature"))
-            answer_record_kind = (
-                "relation" if requires_explicit_relations(signature) else "entity"
-            )
             graph_ids = set(graph_record_ids)
-            allowed_answer_record_ids = [
-                str(record["id"])
-                for record in records
-                if record.get("record_kind") == answer_record_kind
-                and str(record.get("id")) in graph_ids
-            ]
+            if signature.goals:
+                allowed_relation_ids = {
+                    record_id
+                    for goal in signature.goals
+                    if goal.result_status is GoalResultStatus.NONEMPTY
+                    and _goal_requires_relations(goal)
+                    for record_id in goal.result_record_ids
+                }
+                allowed_entity_ids = {
+                    record_id
+                    for goal in signature.goals
+                    if goal.result_status is GoalResultStatus.NONEMPTY
+                    and not _goal_requires_relations(goal)
+                    for record_id in goal.result_record_ids
+                }
+                allowed_answer_record_ids = [
+                    str(record["id"])
+                    for record in records
+                    if str(record.get("id")) in graph_ids
+                    and (
+                        (
+                            record.get("record_kind") == "relation"
+                            and str(record.get("id")) in allowed_relation_ids
+                        )
+                        or (
+                            record.get("record_kind") == "entity"
+                            and str(record.get("id")) in allowed_entity_ids
+                        )
+                    )
+                ]
+            else:
+                answer_record_kind = (
+                    "relation" if requires_explicit_relations(signature) else "entity"
+                )
+                allowed_answer_record_ids = [
+                    str(record["id"])
+                    for record in records
+                    if record.get("record_kind") == answer_record_kind
+                    and str(record.get("id")) in graph_ids
+                ]
         return {
             "current_query": state.get("current_query", ""),
             "locale": state.get("locale", "zh-CN"),
@@ -396,18 +608,25 @@ class Visualizer:
         }
 
     @staticmethod
-    def _with_required_disclosures(
+    def _with_control_disclosure(
         answer: str, state: AgentState, locale: str
     ) -> str:
         signature_value = state.get("query_signature")
         if signature_value is not None and not state.get("no_match"):
             signature = QuerySignature.model_validate(signature_value)
-            if (
+            broad_control = (
                 signature.intent is Intent.FIND_CONTROLLED_COMPANIES
                 and signature.control_policy
                 is ControlQueryPolicy.EXPLICIT_THEN_STRONG_ASSOCIATIONS
                 and RelationType.CONTROLS in signature.verified_empty_relation_types
-            ):
+            ) or any(
+                goal.intent is Intent.FIND_CONTROLLED_COMPANIES
+                and goal.control_policy
+                is ControlQueryPolicy.EXPLICIT_THEN_STRONG_ASSOCIATIONS
+                and RelationType.CONTROLS in goal.verified_empty_relation_types
+                for goal in signature.goals
+            )
+            if broad_control:
                 control_disclosure = (
                     ZH_BROAD_CONTROL_DISCLOSURE
                     if locale.casefold().startswith("zh")
@@ -415,8 +634,7 @@ class Visualizer:
                 )
                 if control_disclosure not in answer:
                     answer = f"{answer} {control_disclosure}"
-        disclaimer = ZH_DISCLAIMER if locale.casefold().startswith("zh") else EN_DISCLAIMER
-        return answer if disclaimer in answer else f"{answer} {disclaimer}"
+        return answer
 
     def _contract_rejection(
         self,
@@ -461,17 +679,17 @@ def error_response(state: AgentState, data_version: str) -> dict[str, Any]:
     is_realtime = semantics.query_requires_realtime_data
     is_unsupported = semantics.intent is Intent.UNSUPPORTED
     if locale.casefold().startswith("zh") and is_realtime:
-        answer = f"该请求需要实时或外部数据，本地演示工具不支持。 {ZH_DISCLAIMER}"
+        answer = "该请求需要实时或外部数据，本地演示工具不支持。"
     elif locale.casefold().startswith("zh") and is_unsupported:
-        answer = f"该请求超出本地企业关系演示工具的支持范围。 {ZH_DISCLAIMER}"
+        answer = "该请求超出本地企业关系演示工具的支持范围。"
     elif locale.casefold().startswith("zh"):
-        answer = f"本次查询未能从本地演示工具生成可验证结果。 {ZH_DISCLAIMER}"
+        answer = "本次查询未能从本地演示工具生成可验证结果。"
     elif is_realtime:
-        answer = f"This request needs live or external data that the local demo tools do not support. {EN_DISCLAIMER}"
+        answer = "This request needs live or external data that the local demo tools do not support."
     elif is_unsupported:
-        answer = f"This request is outside the local relationship demo's supported scope. {EN_DISCLAIMER}"
+        answer = "This request is outside the local relationship demo's supported scope."
     else:
-        answer = f"The local demo tools could not produce a verified result. {EN_DISCLAIMER}"
+        answer = "The local demo tools could not produce a verified result."
     return {
         "answer": answer,
         "query_result_graph": graph,

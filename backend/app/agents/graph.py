@@ -18,7 +18,7 @@ from app.agents.prompts import (
 )
 from app.agents.researcher import Researcher, ResultGate, ToolExecutor, route_after_result_gate
 from app.agents.state import AgentState, TRANSIENT_DEFAULTS
-from app.state_views import request_semantics
+from app.state_views import request_semantics, signature_focus_entity_ids
 from app.agents.visualizer import Visualizer, error_response
 from app.config import Settings
 from app.llm import ModelClient
@@ -28,9 +28,9 @@ from app.memory.graph_ops import empty_graph, graph_id_for, make_graph, merge_gr
 from app.memory.policy import decide_memory_write
 from app.schemas import (
     CacheMetadata,
+    CacheScope,
     ConversationSummary,
     ConversationTurn,
-    Evidence,
     GraphPayload,
     Intent,
     MemoryOperation,
@@ -45,11 +45,34 @@ PROMPT_VERSIONS = {
 }
 
 
-def route_after_planner(state: AgentState) -> str:
+def route_after_planner_analysis(state: AgentState) -> str:
     if state.get("planner_failed"):
         if (
             state.get("run_status") == "running"
-            and state.get("planner_contract_retry_count", 0) == 1
+            and state.get("planner_analysis_retry_count", 0) == 1
+        ):
+            return "retry"
+        return "error"
+    if state.get("planner_terminal_review_pending"):
+        return "review"
+    if state.get("planner_decision") is None:
+        return "tasks"
+    semantics = request_semantics(state)
+    if (
+        semantics.query_requires_realtime_data
+        or semantics.intent is Intent.UNSUPPORTED
+    ):
+        return "error"
+    if semantics.needs_clarification:
+        return "clarify"
+    return "error"
+
+
+def route_after_planner_tasks(state: AgentState) -> str:
+    if state.get("planner_failed"):
+        if (
+            state.get("run_status") == "running"
+            and state.get("planner_task_retry_count", 0) == 1
         ):
             return "retry"
         return "error"
@@ -62,6 +85,10 @@ def route_after_planner(state: AgentState) -> str:
     if semantics.needs_clarification:
         return "clarify"
     return "research"
+
+
+# Compatibility name for callers that route a fully assembled PlannerDecision.
+route_after_planner = route_after_planner_tasks
 
 
 @dataclass(slots=True, kw_only=True)
@@ -92,6 +119,25 @@ def _cache_update(lookup: CacheLookup) -> dict[str, Any]:
     }
 
 
+def cache_focus_entity_ids(payload: Any) -> list[str]:
+    """Restore durable focus, preferring signed v5 per-goal focus."""
+
+    goal_focus = signature_focus_entity_ids(payload.query_signature)
+    if goal_focus:
+        return goal_focus
+    if payload.focus_entity_ids:
+        return list(payload.focus_entity_ids)
+    return list(
+        dict.fromkeys(
+            [
+                *payload.query_signature.context_entity_ids,
+                *payload.query_signature.subject_ids,
+                *payload.query_signature.object_ids,
+            ]
+        )
+    )
+
+
 def build_state_graph(deps: AgentDependencies) -> StateGraph:
     research_step_limit = deps.settings.max_research_steps
     hard_iteration_limit = max(
@@ -102,6 +148,7 @@ def build_state_graph(deps: AgentDependencies) -> StateGraph:
         deps.model,
         max_replans=deps.settings.max_replans,
         max_research_steps=hard_iteration_limit,
+        input_token_budget=deps.settings.planner_input_token_budget,
         entity_catalog=tuple(deps.planner_catalog.get("entity_catalog", [])),
         raw_relation_vocabulary=tuple(
             deps.planner_catalog.get("raw_relation_vocabulary", [])
@@ -229,7 +276,16 @@ def build_state_graph(deps: AgentDependencies) -> StateGraph:
             lookup = CacheLookup(error="cache_unavailable")
         else:
             signature = QuerySignature.model_validate(signature_value)
-            lookup = await deps.cache.lookup_canonical(signature)
+            cache_scope = request_semantics(state).cache_scope
+            lookup = await deps.cache.lookup_canonical(
+                signature,
+                cache_scope=cache_scope,
+                conversation_id=(
+                    state.get("conversation_id")
+                    if cache_scope is CacheScope.CONVERSATION
+                    else None
+                ),
+            )
         return {**_cache_update(lookup), "route_history": route}
 
     def cache_hydrate(state: AgentState) -> dict[str, Any]:
@@ -251,17 +307,10 @@ def build_state_graph(deps: AgentDependencies) -> StateGraph:
             payload.graph.data_version,
             [*payload.graph.evidence, *payload.evidence],
         )
-        focus_entity_ids = list(payload.focus_entity_ids)
-        if not focus_entity_ids:
-            focus_entity_ids = list(
-                dict.fromkeys(
-                    [
-                        *payload.query_signature.context_entity_ids,
-                        *payload.query_signature.subject_ids,
-                        *payload.query_signature.object_ids,
-                    ]
-                )
-            )
+        # V5 signatures keep the complete follow-up referent set per goal.  It is
+        # the durable source on cache hydration; the payload-level list remains a
+        # compatibility copy for pre-goal records.
+        focus_entity_ids = cache_focus_entity_ids(payload)
         resolved = dict(state.get("resolved_entities", {}))
         resolved.update(payload.resolved_entities)
         return {
@@ -316,6 +365,7 @@ def build_state_graph(deps: AgentDependencies) -> StateGraph:
         signature = QuerySignature.model_validate(state["query_signature"])
         graph = GraphPayload.model_validate(state["query_result_graph"])
         cache_scope = request_semantics(state).cache_scope
+        signed_focus = signature_focus_entity_ids(signature)
         result = await deps.cache.write(
             raw_query=state.get("current_query", ""),
             locale=state.get("locale", "zh-CN"),
@@ -323,11 +373,20 @@ def build_state_graph(deps: AgentDependencies) -> StateGraph:
             answer=state.get("answer", ""),
             graph=graph,
             evidence=list(graph.evidence),
-            focus_entity_ids=list(state.get("turn_focus_entity_ids", [])),
+            focus_entity_ids=(
+                signed_focus
+                if signed_focus
+                else list(state.get("turn_focus_entity_ids", []))
+            ),
             # Cache only aliases established for this query.  Session aliases can
             # include user-specific mentions from unrelated prior turns.
             resolved_entities=dict(state.get("query_resolved_entities", {})),
             cache_scope=cache_scope,
+            conversation_id=(
+                state.get("conversation_id")
+                if cache_scope is CacheScope.CONVERSATION
+                else None
+            ),
         )
         return {
             "cache_metadata": current.model_copy(
@@ -414,7 +473,8 @@ def build_state_graph(deps: AgentDependencies) -> StateGraph:
     builder = StateGraph(AgentState)
     builder.add_node("begin_turn", begin_turn)
     builder.add_node("raw_cache_probe", raw_cache_probe)
-    builder.add_node("planner", planner)
+    builder.add_node("planner_analyze", planner.analyze)
+    builder.add_node("planner_tasks", planner.plan_tasks)
     builder.add_node("researcher", researcher)
     builder.add_node("result_gate", result_gate)
     builder.add_node("canonical_cache_probe", canonical_cache_probe)
@@ -431,13 +491,24 @@ def build_state_graph(deps: AgentDependencies) -> StateGraph:
     builder.add_conditional_edges(
         "raw_cache_probe",
         lambda state: "hit" if state.get("cache_hit") else "miss",
-        {"hit": "cache_hydrate", "miss": "planner"},
+        {"hit": "cache_hydrate", "miss": "planner_analyze"},
     )
     builder.add_conditional_edges(
-        "planner",
-        route_after_planner,
+        "planner_analyze",
+        route_after_planner_analysis,
         {
-            "retry": "planner",
+            "retry": "planner_analyze",
+            "review": "planner_analyze",
+            "error": "error_response",
+            "clarify": "visualizer",
+            "tasks": "planner_tasks",
+        },
+    )
+    builder.add_conditional_edges(
+        "planner_tasks",
+        route_after_planner_tasks,
+        {
+            "retry": "planner_tasks",
             "error": "error_response",
             "clarify": "visualizer",
             "research": "researcher",
@@ -449,7 +520,7 @@ def build_state_graph(deps: AgentDependencies) -> StateGraph:
         route_after_result_gate,
         {
             "research": "researcher",
-            "replan": "planner",
+            "replan": "planner_analyze",
             "no_match": "visualizer",
             "valid": "canonical_cache_probe",
             "error": "error_response",

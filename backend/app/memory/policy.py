@@ -9,6 +9,7 @@ from app.evidence_contract import requires_explicit_relations
 from app.memory.graph_ops import evidence_coverage, graph_is_valid
 from app.schemas import (
     Evidence,
+    GoalResultStatus,
     GraphPayload,
     Intent,
     MemoryOperation,
@@ -62,6 +63,43 @@ def decide_memory_write(state: Mapping[str, Any]) -> MemoryDecision:
     if not state.get("query_signature") or not state.get("answer"):
         return MemoryDecision(MemoryOperation.SKIP, "missing_cache_payload")
     signature = QuerySignature.model_validate(state["query_signature"])
-    if requires_explicit_relations(signature) and not graph.edges:
+    if signature.intent is Intent.MULTI_GOAL and not signature.goals:
+        return MemoryDecision(MemoryOperation.SKIP, "missing_goal_signatures")
+    if signature.goals:
+        graph_record_ids = {
+            *(node.id for node in graph.nodes),
+            *(edge.id for edge in graph.edges),
+        }
+        graph_node_ids = {node.id for node in graph.nodes}
+        graph_edge_ids = {edge.id for edge in graph.edges}
+        signed_focus = {
+            entity_id
+            for goal in signature.goals
+            for entity_id in goal.focus_entity_ids
+        }
+        if signed_focus != set(state.get("turn_focus_entity_ids", [])):
+            return MemoryDecision(MemoryOperation.SKIP, "goal_focus_mismatch")
+        if signed_focus - graph_node_ids:
+            return MemoryDecision(MemoryOperation.SKIP, "goal_focus_outside_graph")
+        for goal in signature.goals:
+            result_ids = set(goal.result_record_ids)
+            if result_ids - graph_record_ids:
+                return MemoryDecision(
+                    MemoryOperation.SKIP,
+                    "goal_records_outside_graph",
+                )
+            if goal.result_status is not GoalResultStatus.NONEMPTY:
+                continue
+            relation_goal = goal.intent in {
+                Intent.FIND_CONTROLLED_COMPANIES,
+                Intent.FIND_RELATED_COMPANIES,
+                Intent.LOCATE_ENTITIES,
+            } or bool(goal.relation_types)
+            if relation_goal and not (result_ids & graph_edge_ids):
+                return MemoryDecision(
+                    MemoryOperation.SKIP,
+                    "missing_required_relation_evidence",
+                )
+    elif requires_explicit_relations(signature) and not graph.edges:
         return MemoryDecision(MemoryOperation.SKIP, "missing_required_relation_evidence")
     return MemoryDecision(MemoryOperation.ADD, "first_verified_result")

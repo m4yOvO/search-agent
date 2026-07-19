@@ -10,7 +10,9 @@ this module never substitutes deterministic answers or silently changes models.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import date, datetime
 from enum import Enum
 from pathlib import Path
@@ -62,11 +64,99 @@ class ModelInvocationError(RuntimeError):
 class ModelOutputContractError(ValueError):
     """Sanitized HTTP-success response that failed the requested output contract."""
 
-    def __init__(self, *, purpose: str) -> None:
+    def __init__(
+        self,
+        *,
+        purpose: str,
+        issues: Sequence["ModelContractIssue"] = (),
+    ) -> None:
         self.purpose = purpose
+        # These issues contain only a normalized Schema path and Pydantic's
+        # stable error type.  They deliberately exclude the rejected value,
+        # validation message, provider payload, and exception cause.
+        self.issues = tuple(issues)[:3]
         super().__init__(
             f"Model output violated the structured contract for {purpose!r}"
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ModelContractIssue:
+    """One bounded, provider-safe structured-output validation issue."""
+
+    field: str
+    constraint: str
+
+
+_SAFE_SCHEMA_SEGMENT = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
+_SAFE_CONSTRAINT = re.compile(r"^[a-z][a-z0-9_]{0,79}$")
+
+
+def safe_model_contract_issues(error: BaseException) -> tuple[ModelContractIssue, ...]:
+    """Extract stable field feedback without retaining rejected model output.
+
+    Pydantic error dictionaries can contain the rejected value, an exception
+    context, and a human-readable message.  None of those cross this boundary.
+    List indexes are normalized to ``[]`` so feedback remains useful for N=1,
+    N=2, or any larger entity/goal count without leaking response cardinality.
+    """
+
+    validation_error = _find_validation_error(error)
+    if validation_error is None:
+        return ()
+    issues: list[ModelContractIssue] = []
+    for item in validation_error.errors(
+        include_url=False,
+        include_context=False,
+        include_input=False,
+    ):
+        location = item.get("loc", ())
+        field = _safe_schema_path(location if isinstance(location, tuple) else ())
+        raw_constraint = item.get("type")
+        constraint = (
+            raw_constraint
+            if isinstance(raw_constraint, str)
+            and _SAFE_CONSTRAINT.fullmatch(raw_constraint)
+            else "schema_constraint"
+        )
+        issue = ModelContractIssue(field=field, constraint=constraint)
+        if issue not in issues:
+            issues.append(issue)
+        if len(issues) == 3:
+            break
+    return tuple(issues)
+
+
+def _find_validation_error(error: BaseException) -> ValidationError | None:
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    while pending and len(seen) < 6:
+        current = pending.pop(0)
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, ValidationError):
+            return current
+        for nested in (current.__cause__, current.__context__):
+            if isinstance(nested, BaseException):
+                pending.append(nested)
+    return None
+
+
+def _safe_schema_path(location: tuple[Any, ...]) -> str:
+    parts: list[str] = []
+    for raw_segment in location[:6]:
+        if isinstance(raw_segment, int):
+            if parts:
+                parts[-1] = f"{parts[-1]}[]"
+            elif not parts:
+                parts.append("[]")
+            continue
+        if isinstance(raw_segment, str) and _SAFE_SCHEMA_SEGMENT.fullmatch(raw_segment):
+            parts.append(raw_segment)
+        else:
+            parts.append("field")
+    return ".".join(parts) if parts else "root"
 
 
 @runtime_checkable
@@ -174,8 +264,17 @@ class OpenAIModelClient:
                 # parsed model despite include_raw=True.
                 parsed: Any = envelope
             elif isinstance(envelope, Mapping):
-                if envelope.get("parsing_error") is not None:
-                    raise ModelOutputContractError(purpose=normalized_purpose)
+                parsing_error = envelope.get("parsing_error")
+                if parsing_error is not None:
+                    issues = (
+                        safe_model_contract_issues(parsing_error)
+                        if isinstance(parsing_error, BaseException)
+                        else ()
+                    )
+                    raise ModelOutputContractError(
+                        purpose=normalized_purpose,
+                        issues=issues,
+                    )
                 parsed = envelope.get("parsed")
             else:
                 raise ModelOutputContractError(purpose=normalized_purpose)
@@ -183,12 +282,25 @@ class OpenAIModelClient:
                 raise ModelOutputContractError(purpose=normalized_purpose)
             try:
                 return response_model.model_validate(parsed)
-            except (ValidationError, TypeError, ValueError):
+            except ValidationError as exc:
                 raise ModelOutputContractError(
-                    purpose=normalized_purpose
+                    purpose=normalized_purpose,
+                    issues=safe_model_contract_issues(exc),
                 ) from None
+            except (TypeError, ValueError):
+                raise ModelOutputContractError(purpose=normalized_purpose) from None
         except ModelOutputContractError:
             raise
+        except ValidationError as exc:
+            # Some LangChain structured-output adapters validate the parsed
+            # object inside ``ainvoke`` even when ``include_raw=True``.  That
+            # means an HTTP-success response can raise Pydantic directly instead
+            # of returning it in ``parsing_error``.  It is still a model-output
+            # contract failure and is eligible for the Agent's one safe retry.
+            raise ModelOutputContractError(
+                purpose=normalized_purpose,
+                issues=safe_model_contract_issues(exc),
+            ) from None
         except Exception:
             # Do not retain the provider exception as a cause: SDK exceptions may
             # contain request headers, URLs, or other credential-adjacent details.

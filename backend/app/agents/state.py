@@ -13,7 +13,9 @@ from app.schemas import (
     ConversationTurn,
     Evidence,
     GraphPayload,
+    PlannerAnalysisDecision,
     PlannerDecision,
+    PlannerTaskDecision,
     QuerySignature,
     ToolError,
 )
@@ -44,6 +46,15 @@ class AgentState(TypedDict, total=False):
     turn_focus_entity_ids: Annotated[list[str], UntrackedValue]
 
     # Planner request state.
+    planner_analysis: Annotated[PlannerAnalysisDecision | None, UntrackedValue]
+    planner_terminal_candidate: Annotated[
+        PlannerAnalysisDecision | None, UntrackedValue
+    ]
+    planner_terminal_review_pending: Annotated[bool, UntrackedValue]
+    planner_terminal_review_count: Annotated[int, UntrackedValue]
+    planner_task_plan: Annotated[PlannerTaskDecision | None, UntrackedValue]
+    planner_prompt_profile: Annotated[list[str], UntrackedValue]
+    planner_contract_feedback: Annotated[dict[str, str] | None, UntrackedValue]
     planner_decision: Annotated[PlannerDecision | None, UntrackedValue]
     planner_failed: Annotated[bool, UntrackedValue]
     query_signature: Annotated[QuerySignature | None, UntrackedValue]
@@ -53,6 +64,8 @@ class AgentState(TypedDict, total=False):
     replan_reasons: Annotated[list[str], UntrackedValue]
     research_failure_reason: Annotated[str | None, UntrackedValue]
     planner_contract_retry_count: Annotated[int, UntrackedValue]
+    planner_analysis_retry_count: Annotated[int, UntrackedValue]
+    planner_task_retry_count: Annotated[int, UntrackedValue]
     researcher_contract_retry_count: Annotated[int, UntrackedValue]
     visualizer_contract_retry_count: Annotated[int, UntrackedValue]
 
@@ -104,6 +117,13 @@ class AgentState(TypedDict, total=False):
 TRANSIENT_DEFAULTS: dict[str, Any] = {
     "prior_focus_entity_ids": [],
     "turn_focus_entity_ids": [],
+    "planner_analysis": None,
+    "planner_terminal_candidate": None,
+    "planner_terminal_review_pending": False,
+    "planner_terminal_review_count": 0,
+    "planner_task_plan": None,
+    "planner_prompt_profile": [],
+    "planner_contract_feedback": None,
     "planner_decision": None,
     "planner_failed": False,
     "query_signature": None,
@@ -113,6 +133,8 @@ TRANSIENT_DEFAULTS: dict[str, Any] = {
     "replan_reasons": [],
     "research_failure_reason": None,
     "planner_contract_retry_count": 0,
+    "planner_analysis_retry_count": 0,
+    "planner_task_retry_count": 0,
     "researcher_contract_retry_count": 0,
     "visualizer_contract_retry_count": 0,
     "research_records": [],

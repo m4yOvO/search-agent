@@ -16,6 +16,7 @@ htmlcov/
 __pycache__/
 *.py[cod]
 .venv/
+/backend/tests/
 runtime/
 chroma-data/
 frontend/node_modules/
