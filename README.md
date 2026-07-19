@@ -35,11 +35,11 @@ LangGraph 协调 Planner、Researcher、Visualizer，调用本地 mock 数据工
 
 ```bash
 cd '/path/to/search agent'
-cp .env.example .env
+test -f .env || cp .env.example .env
 chmod 600 .env
 ```
 
-编辑 `.env`，至少填写：
+首次启动时编辑 `.env`，至少填写：
 
 ```dotenv
 OPENAI_API_KEY=你的_OpenAI_API_Key
@@ -54,17 +54,17 @@ docker compose up -d --build
 docker compose ps
 ```
 
-旧版独立 Compose 命令等价为：
+若本机安装了兼容当前 Compose Spec 的独立 `docker-compose`，也可以使用：
 
 ```bash
 docker-compose up -d --build
 ```
 
-服务地址：
+默认服务地址（修改 `.env` 中的宿主机端口后，请同步替换下列 URL）：
 
 - Web UI：<http://localhost:3000>
 - FastAPI 文档：<http://localhost:8000/docs>
-- Chroma：<http://localhost:8001>
+- Chroma 健康端点：<http://localhost:8001/api/v2/heartbeat>
 
 健康检查：
 
